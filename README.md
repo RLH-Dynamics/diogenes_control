@@ -4,11 +4,10 @@
 - Implement a time over- or under-run exception.
 - Get an equivalent inverse-kinematics solution working.
 
-- Plan for validating the code:
-    - Test Leg class's set_output_state_vector().
-        - First test with just holding the leg in place.
-        - Run a basic IK trot or something like that.
-    - Test Leg class's shutdown().
-        - Test with both get_latest_state_vector() and set_output_state_vector().
-
 - Write a function to validate that the hardware watchdogs did infact get set up properly.
+
+- Write main-ik-linear.py:
+    - Ensure that the safety manager is running so we don't accidentally go out of bounds.
+        - Double check this on startup!
+    - Generate a basic front-to-back, side-to-side, and up-down linear gait.
+    - Follow the gait at a 50Hz loop rate.
