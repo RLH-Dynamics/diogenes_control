@@ -69,7 +69,7 @@ def calculate_leg_ik(x: float, y: float, z: float, is_left_stance: bool = True, 
     return q1, q2, q3
 
 def main():
-    print("[INFO] Setting up Leg for linear IK tracking test...")
+    print("[INFO] Setting up Leg for 3D linear IK tracking test...")
 
     # Extract configuration
     motor_ids = [config['id'] for config in JOINT_CONFIG.values()]
@@ -81,12 +81,18 @@ def main():
     )
     safety_monitor = SafetyMonitor(joint_limits=JOINT_CONFIG)
 
-    # Trajectory Parameters (using stable center defaults from ik-visualizer.py)
+    # Trajectory Parameters
     CENTER_X = -2.5
     CENTER_Y = 112.0
-    CENTER_Z = -177.0 - 150.0
-    STROKE_LENGTH_Y = 30.0  # Total back-to-front stroke length (modulate as needed)
-    CYCLE_PERIOD = 4.0      # Seconds to complete one full back-and-forth stroke
+    CENTER_Z = -177.0
+    
+    # Define stroke lengths for all three axes. 
+    # Set to 0.0 to disable movement along that specific axis.
+    STROKE_LENGTH_X = 20.0  
+    STROKE_LENGTH_Y = 60.0  
+    STROKE_LENGTH_Z = 20.0  
+    
+    CYCLE_PERIOD = 2.0 # Seconds to complete one full cycle
 
     try:
         # Initialize Hardware
@@ -113,7 +119,7 @@ def main():
             3: {'pos': q3, 'vel': 0.0, 'torque': 0.0}
         }
 
-        print(f"[INFO] Entering 50Hz linear IK loop (Press Ctrl+C to stop)...")
+        print(f"[INFO] Entering 50Hz 3D IK loop (Press Ctrl+C to stop)...")
         start_time = time.perf_counter()
 
         while True:
@@ -129,13 +135,20 @@ def main():
             # 2. Hard fault immediately if the robot has strayed outside physical bounds
             safety_monitor.verify_measured_state(state_vector)
 
-            # 3. Compute the new trajectory target using a smooth sine wave generator
+            # 3. Compute the new trajectory targets using a synchronized phase
             t = time.perf_counter() - start_time
-            y_offset = (STROKE_LENGTH_Y / 2.0) * math.sin(2.0 * math.pi * t / CYCLE_PERIOD)
+            phase = 2.0 * math.pi * t / CYCLE_PERIOD
+            
+            x_offset = (STROKE_LENGTH_X / 2.0) * math.sin(phase)
+            y_offset = (STROKE_LENGTH_Y / 2.0) * math.sin(phase)
+            z_offset = (STROKE_LENGTH_Z / 2.0) * math.sin(phase)
+            
+            target_x = CENTER_X + x_offset
             target_y = CENTER_Y + y_offset
+            target_z = CENTER_Z + z_offset
 
-            # 4. Compute Inverse Kinematics for the new target
-            q1, q2, q3 = calculate_leg_ik(CENTER_X, target_y, CENTER_Z, is_left_stance=True, knee_forward=True)
+            # 4. Compute Inverse Kinematics for the new 3D target
+            q1, q2, q3 = calculate_leg_ik(target_x, target_y, target_z, is_left_stance=True, knee_forward=True)
             
             # The SafetyMonitor expects a simple array ordered explicitly by ID: [hip (1), thigh (2), knee (3)]
             commanded_array = [q1, q2, q3]
