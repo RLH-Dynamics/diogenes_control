@@ -183,6 +183,9 @@ def main():
             else:
                 print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
 
+            actual_loop_time = time.perf_counter() - loop_start
+            print(f"[INFO] Actual loop time: {actual_loop_time * 1000:.2f} ms")
+
     except SafetyLimitError as e:
         print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
     except (HardwareIOError, ActuatorFault, HardwareError) as e:
