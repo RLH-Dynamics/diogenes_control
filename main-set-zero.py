@@ -78,10 +78,10 @@ def main():
                 all_zeroed = False
                 
         if all_zeroed:
-            print("\n{GREEN}[DONE] All motors successfully zeroed and verified.{RESET}")
+            print(f"\n{GREEN}[DONE] All motors successfully zeroed and verified.{RESET}")
             print("You may need to power cycle the motors to ensure the calibration is permanently saved.")
         else:
-            print("\n{RED}[CRITICAL ERROR] One or more motors failed to verify their zero position.{RESET}")
+            print(f"\n{RED}[CRITICAL ERROR] One or more motors failed to verify their zero position.{RESET}")
 
     except Exception as e:
         print(f"\n{RED}[FATAL] An unexpected error occurred: {e}{RESET}")
