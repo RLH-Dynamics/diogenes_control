@@ -4,7 +4,11 @@ from robot.leg import Leg
 from control.policy import Policy
 from utils.safety import SafetyMonitor
 from utils.exceptions import HardwareIOError, ActuatorFault, HardwareError, SafetyLimitError
-from config import JOINT_CONFIG, RS03_LIMITS, KP_GAIN, KD_GAIN, MODEL_PATH, NUM_JOINTS, HISTORY_LEN, DT, DEFAULT_POS, ACTION_SCALE, CAN_CHANNEL, HOST_ID
+from config import (
+    JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID, 
+    KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
+    HISTORY_LEN, DEFAULT_POS, ACTION_SCALE
+)
 
 def format_targets(target_array):
     """
@@ -18,58 +22,112 @@ def format_targets(target_array):
         for i, config in enumerate(sorted_configs)
     }
 
-def setup(leg, policy, safety_monitor):
-    leg.init_leg() # Starts the CAN bus, enables all motors, and checks the enable was succesful.
-    start_time  = time.perf_counter()
-    state_vector = leg.get_latest_state_vector(target_states={config['id']: {'pos': 0.0, 'vel': 0.0, 'torque': 0.0} for config in JOINT_CONFIG.values()}, kp=0.0, kd=0.0) # Get the latest state vector directly from the actuators -> make sure to use a zero kd and kp here!
-    safety_monitor.verify_measured_state(state_vector) # Ensure the current state vector is not out of bounds.
-    physical_targets = policy.compute_action(state_vector)
-    safety_monitor.validate_commanded_targets(physical_targets)
-    target_dict = format_targets(physical_targets)
-    leg.set_output_state_vector(physical_targets=target_dict,kp=KP_GAIN,kd=KD_GAIN)
-    elapsed = time.perf_counter() - start_time
-    if elapsed < DT:
-        time.sleep(DT - elapsed)
-    return target_dict
-
-def loop(leg, policy, safety_monitor, prev_targets):
-    start_time = time.perf_counter()
-    state_vector = leg.get_latest_state_vector(target_states=prev_targets,kp=KP_GAIN,kd=KD_GAIN)
-    safety_monitor.verify_measured_state(state_vector)
-    physical_targets = policy.compute_action(state_vector)
-    safety_monitor.validate_commanded_targets(physical_targets)
-    target_dict = format_targets(physical_targets)
-    leg.set_output_state_vector(physical_targets=target_dict, kp=KP_GAIN, kd=KD_GAIN)
-    elapsed = time.perf_counter() - start_time
-    if elapsed < DT:
-        time.sleep(DT - elapsed)
-    return target_dict
-
-def shutdown(leg):
-    leg.shutdown()
-    return
-
 def main():
-    leg = Leg(limits=RS03_LIMITS, channel=CAN_CHANNEL, host_id=HOST_ID, motor_ids=[config['id'] for config in JOINT_CONFIG.values()])
-    direction_vector = [config['direction'] for config in sorted(JOINT_CONFIG.values(), key=lambda x: x['id'])]
-    policy = Policy(model_path=MODEL_PATH, num_joints=NUM_JOINTS, history_len=HISTORY_LEN, period=DT, default_pos=DEFAULT_POS, direction_vector=direction_vector, action_scale=ACTION_SCALE)
+    print("[INFO] Setting up Leg for RL policy control loop...")
+
+    # Extract motor IDs from the joint configuration
+    motor_ids = [config['id'] for config in JOINT_CONFIG.values()]
+    
+    # Instantiate the Leg class
+    leg = Leg(
+        limits=RS03_LIMITS,
+        channel=CAN_CHANNEL,
+        host_id=HOST_ID,
+        motor_ids=motor_ids
+    )
+    
+    # Instantiate the Safety Monitor
     safety_monitor = SafetyMonitor(joint_limits=JOINT_CONFIG)
 
+    # Instantiate the RL Policy
+    direction_vector = [config['direction'] for config in sorted(JOINT_CONFIG.values(), key=lambda x: x['id'])]
+    policy = Policy(
+        model_path=MODEL_PATH, 
+        num_joints=NUM_JOINTS, 
+        history_len=HISTORY_LEN, 
+        period=DT, 
+        default_pos=DEFAULT_POS, 
+        direction_vector=direction_vector, 
+        action_scale=ACTION_SCALE
+    )
+
     try:
-        current_targets = setup(leg, policy, safety_monitor)
+        # Initialize the hardware
+        leg.init_leg()
+        print("[INFO] Initialization complete.")
+
+        # Read the initial zero state to verify the robot is safely communicative before starting
+        print("[INFO] Checking initial hardware state...")
+        zero_targets = {mid: {'pos': 0.0, 'vel': 0.0, 'torque': 0.0} for mid in motor_ids}
+        initial_state_vector = leg.get_latest_state_vector(
+            target_states=zero_targets, 
+            kp=0.0, 
+            kd=0.0
+        )
+        
+        # Verify measured state is within safe operating bounds defined in JOINT_CONFIG
+        safety_monitor.verify_measured_state(initial_state_vector)
+
+        # Pre-compute the starting position using the initial physical state
+        initial_physical_targets = policy.compute_action(initial_state_vector)
+        safety_monitor.validate_commanded_targets(initial_physical_targets)
+        current_targets = format_targets(initial_physical_targets)
+
+        hz = int(1.0 / DT)
+        print(f"[INFO] Entering {hz}Hz RL control loop (Press Ctrl+C to stop)...")
+        start_time = time.perf_counter()
+        
         while True:
-            current_targets =  loop(leg, policy, safety_monitor, current_targets)
+            loop_start = time.perf_counter()
+
+            # 1. Pipeline out the previous targets and read the latest physical state
+            state_vector = leg.get_latest_state_vector(
+                target_states=current_targets, 
+                kp=KP_GAIN, 
+                kd=KD_GAIN
+            )
+
+            # 2. Hard fault immediately if the robot has strayed outside physical bounds
+            safety_monitor.verify_measured_state(state_vector)
+
+            # 3. Compute the new actions from the ONNX policy
+            physical_targets = policy.compute_action(state_vector)
+
+            # 4. Validate the commanded targets before applying them
+            safety_monitor.validate_commanded_targets(physical_targets)
+
+            # 5. Format targets for the leg API
+            current_targets = format_targets(physical_targets)
+
+            # 6. Send the validated output targets
+            leg.set_output_state_vector(
+                physical_targets=current_targets, 
+                kp=KP_GAIN, 
+                kd=KD_GAIN
+            )
+
+            # 7. Loop Timing Control
+            elapsed = time.perf_counter() - loop_start
+            if elapsed < DT:
+                time.sleep(DT - elapsed)
+            else:
+                print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
+
+            # Optional: Uncomment to monitor exact loop timing like in main-ik-step.py
+            # actual_loop_time = time.perf_counter() - loop_start
+            # print(f"[INFO] Elapsed (Active): {elapsed * 1000:.2f} ms | Actual Loop (Total): {actual_loop_time * 1000:.2f} ms")
+
     except SafetyLimitError as e:
         print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
     except (HardwareIOError, ActuatorFault, HardwareError) as e:
         print(f"\n[CRITICAL] Hardware Failure: {e}")
         print("Initiating emergency shutdown...")
     except KeyboardInterrupt:
-        print("\n[INFO] Interrupted by user. Shutting down gracefully...")
+        print("\n[INFO] KeyboardInterrupt detected. Stopping RL policy...")
     except Exception as e:
-        print(f"\n[FATAL] Unexpected software error: {e}")
+        print(f"\n[FATAL] An unexpected error occurred: {e}")
     finally:
-        shutdown(leg)
+        leg.shutdown()
         sys.exit(0)
 
 if __name__ == "__main__":
