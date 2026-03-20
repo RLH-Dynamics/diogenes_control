@@ -1,3 +1,7 @@
+# SETUP:
+- Before running any main Python scripts inside this folder, setup the terminal by typing:
+source setup.sh
+
 # TO DO:
 - Check loop timing in main-ik-step.py.
 
