@@ -1,5 +1,6 @@
 import sys
 import time
+import numpy as np
 from robot.leg import Leg
 from control.policy import Policy
 from utils.safety import SafetyMonitor
@@ -73,10 +74,20 @@ def main():
         safety_monitor.validate_commanded_targets(initial_physical_targets)
         current_targets = format_targets(initial_physical_targets)
 
-        hz = int(1.0 / DT)
-        print(f"[INFO] Entering {hz}Hz RL control loop (Press Ctrl+C to stop)...")
-        start_time = time.perf_counter()
+        # --- High-Frequency Control Setup ---
+        policy_hz = int(1.0 / DT)
+        control_hz = 200.0
+        control_dt = 1.0 / control_hz
+        policy_update_interval = int(control_hz / policy_hz)
+
+        print(f"[INFO] Entering {control_hz}Hz Control / {policy_hz}Hz Policy loop (Press Ctrl+C to stop)...")
         
+        loop_counter = 0
+        previous_physical_targets = np.array(initial_physical_targets, dtype=np.float32)
+        new_physical_targets = np.array(initial_physical_targets, dtype=np.float32)
+        
+        start_time = time.perf_counter()
+
         while True:
             loop_start = time.perf_counter()
 
@@ -90,32 +101,41 @@ def main():
             # 2. Hard fault immediately if the robot has strayed outside physical bounds
             safety_monitor.verify_measured_state(state_vector)
 
-            # 3. Compute the new actions from the ONNX policy
-            physical_targets = policy.compute_action(state_vector)
+            # 3. Compute the new actions from the ONNX policy at the slower policy frequency
+            if loop_counter % policy_update_interval == 0:
+                previous_physical_targets = np.copy(new_physical_targets)
+                new_physical_targets = np.array(policy.compute_action(state_vector), dtype=np.float32)
 
-            # 4. Validate the commanded targets before applying them
-            safety_monitor.validate_commanded_targets(physical_targets)
+            # 4. Interpolate actions to send smoothly at the faster control frequency
+            # Calculate interpolation factor (alpha ranges from 0.0 to 1.0 between policy ticks)
+            denominator = float(max(1, policy_update_interval - 1))
+            interpolation_alpha = (loop_counter % policy_update_interval) / denominator
+            
+            interpolated_targets = (1.0 - interpolation_alpha) * previous_physical_targets + interpolation_alpha * new_physical_targets
 
-            # 5. Format targets for the leg API
-            current_targets = format_targets(physical_targets)
+            # 5. Validate the commanded targets before applying them
+            safety_monitor.validate_commanded_targets(interpolated_targets.tolist())
 
-            # 6. Send the validated output targets
+            # 6. Format targets for the leg API
+            current_targets = format_targets(interpolated_targets.tolist())
+
+            # 7. Send the validated output targets
             leg.set_output_state_vector(
                 physical_targets=current_targets, 
                 kp=KP_GAIN, 
                 kd=KD_GAIN
             )
 
-            # 7. Loop Timing Control
+            # 8. Loop Timing Control
             elapsed = time.perf_counter() - loop_start
-            if elapsed < DT:
-                time.sleep(DT - elapsed)
+            if elapsed < control_dt:
+                time.sleep(control_dt - elapsed)
             else:
-                print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
+                # Optional: Uncomment to track real-time overruns
+                pass 
+                # print(f"[WARN] Loop overrun by {(elapsed - control_dt)*1000:.2f} ms")
 
-            # Optional: Uncomment to monitor exact loop timing like in main-ik-step.py
-            # actual_loop_time = time.perf_counter() - loop_start
-            # print(f"[INFO] Elapsed (Active): {elapsed * 1000:.2f} ms | Actual Loop (Total): {actual_loop_time * 1000:.2f} ms")
+            loop_counter += 1
 
     except SafetyLimitError as e:
         print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
