@@ -44,7 +44,7 @@ class Policy:
 
         flat_pos = [val for step in self.pos_hist for val in step]
         flat_vel = [val for step in self.vel_hist for val in step]
-        obs = np.array(flat_pos + flat_vel + phase_signal, dtype=np.float32).reshape(1,-1)
+        obs = np.array(flat_pos + flat_vel, dtype=np.float32).reshape(1,-1)
 
         # 4. Inference
         raw_actions = self.session.run(None, {self.input_name: obs})[0][0]
