@@ -3,6 +3,9 @@
 source setup.sh
 
 # TO DO:
+- Implement lowpass filter on the velocity readings.
+- 
+
 - Check loop timing in main-ik-step.py.
 
 - Define, add, and subtract absolute encoder offsets. We are not doing that right now! (?)
