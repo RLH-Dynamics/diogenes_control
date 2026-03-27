@@ -15,7 +15,7 @@ class Leg:
     # We should try writing a new function to verify that this was succesful.
     def init_leg(self):
         self.robstride.init_CAN_bus()
-        self.robstride.enable_and_verify_all(limits=self.limits)
+        self.robstride.enable_and_verify_all_MIT(limits=self.limits)
     
     def get_latest_state_vector(self, target_states: dict, kp: float, kd: float):
         self.robstride.flush_CAN_bus()

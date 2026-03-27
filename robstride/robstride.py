@@ -175,7 +175,7 @@ class Robstride:
                 limits=limits
             )
 
-    def enable_and_verify_all(self, limits: dict, timeout: float = 0.5):
+    def enable_and_verify_all_MIT(self, limits: dict, timeout: float = 0.5):
         """
         Enables all actuators, forces them into a passive MIT state, and verifies 
         their response to confirm they are active and responsive.
