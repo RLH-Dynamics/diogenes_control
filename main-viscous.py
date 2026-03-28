@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
 
 # Internal Project Imports
 from robot.leg import Leg
@@ -47,6 +48,12 @@ COAST_STOP_VELOCITY = 0.5  # Velocity threshold (rad/s) to consider the motor "s
 # 4. Timing
 LOOP_RATE_HZ = 100.0       # Polling rate during coast down (higher = better curve fit)
 DT = 1.0 / LOOP_RATE_HZ
+
+# 5. Known Friction Configuration (Outputs from main-coulomb.py)
+# Used to calculate Reflected Inertia and Raw Viscous Damping. 
+# Set to None if you do not want to calculate derived properties.
+KNOWN_COULOMB_NM_MEAN = 0.5  # REPLACE with your main-coulomb.py mean (Nm)
+KNOWN_COULOMB_NM_STD = 0.1   # REPLACE with your main-coulomb.py std (Nm)
 
 # =============================================================================
 # EXPERIMENT FUNCTIONS
@@ -114,30 +121,50 @@ def run_coast_down_trial(leg, motor_id, trial_dir, trial_idx):
     t_arr = np.array(recorded_times)
     v_arr = np.array(recorded_velocities)
 
-    # 4. Calculate Decay Constant using Log-Linear Regression
-    # V(t) = V0 * e^(-decay_rate * t)  =>  ln(V) = ln(V0) - decay_rate * t
-    valid_idx = v_arr > 0.1 # Filter out negatives/zeros before log
-    decay_rate = None
-    v0_fit = None
+    # 4. Calculate Decay Constants using Non-Linear Curve Fit (Mixed Friction Model)
+    # ODE: dV/dt = -a*V - b  ---> Solution: V(t) = (V0 + b/a) * exp(-a*t) - b/a
+    # where a = viscous term (c/I), b = coulomb term (C_dry/I)
+    
+    def coast_model(t, v0, a, b):
+        # Clamp 'a' to a tiny positive number to prevent division by zero during solver iteration
+        a_safe = max(a, 1e-6) 
+        return (v0 + b/a_safe) * np.exp(-a_safe * t) - b/a_safe
+
+    # Filter for positive velocities
+    valid_idx = v_arr > 0.05 
+    t_fit_data = t_arr[valid_idx]
+    v_fit_data = v_arr[valid_idx]
+    
+    v0_fit, viscous_rate, coulomb_rate = None, None, None
     
     if np.sum(valid_idx) > 5:
-        p = np.polyfit(t_arr[valid_idx], np.log(v_arr[valid_idx]), 1)
-        decay_rate = -p[0]       # Represents c/I (viscous damping / inertia)
-        v0_fit = np.exp(p[1])    # Theoretical V0
-        print(f"  -> Estimated Decay Rate (c/I): {decay_rate:.4f} s^-1")
+        try:
+            # Initial guesses: V0 ~ starting vel, a ~ 0.5 (low viscous), b ~ 2.0 (moderate dry friction)
+            p0 = [v_fit_data[0], 0.5, 2.0]
+            # Bounds: V0 > 0, a >= 0 (viscous), b >= 0 (coulomb)
+            bounds = ([0, 0, 0], [np.inf, np.inf, np.inf])
+            
+            popt, _ = curve_fit(coast_model, t_fit_data, v_fit_data, p0=p0, bounds=bounds)
+            v0_fit, viscous_rate, coulomb_rate = popt
+            
+            print(f"  -> Viscous Damping Rate (c/I): {viscous_rate:.4f} s^-1")
+            print(f"  -> Coulomb Friction Rate (C_dry/I): {coulomb_rate:.4f} rad/s^2")
+        except RuntimeError:
+            print("  -> [WARN] Curve fit failed to converge.")
     else:
         print("  -> [WARN] Not enough clean data points for curve fit.")
 
     # Generate a plot for this specific trial
-    plot_trial_data(trial_dir, trial_idx, t_arr, v_arr, v0_fit, decay_rate)
+    plot_trial_data(trial_dir, trial_idx, t_arr, v_arr, v0_fit, viscous_rate, coulomb_rate)
 
     return {
         'time': t_arr,
         'vel': v_arr,
-        'decay_rate': decay_rate
+        'viscous_rate': viscous_rate,
+        'coulomb_rate': coulomb_rate
     }
 
-def plot_trial_data(path, idx, t, v, v0_fit, decay_rate):
+def plot_trial_data(path, idx, t, v, v0_fit, viscous_rate, coulomb_rate):
     """Saves a diagnostic plot for a single coast-down trial."""
     plt.figure(figsize=(8, 5))
     
@@ -145,11 +172,18 @@ def plot_trial_data(path, idx, t, v, v0_fit, decay_rate):
     plt.plot(t, v, 'b.', alpha=0.5, label='Measured Velocity')
     
     # Curve Fit Overlay
-    if decay_rate is not None and v0_fit is not None:
+    if None not in (v0_fit, viscous_rate, coulomb_rate):
         t_fit = np.linspace(0, max(t), 100)
-        v_fit = v0_fit * np.exp(-decay_rate * t_fit)
+        
+        # Reconstruct the combined model
+        a_safe = max(viscous_rate, 1e-6)
+        v_fit = (v0_fit + coulomb_rate/a_safe) * np.exp(-a_safe * t_fit) - coulomb_rate/a_safe
+        
+        # Stop plotting the fit once it crosses zero (since dry friction reverses direction)
+        v_fit = np.maximum(v_fit, 0)
+        
         plt.plot(t_fit, v_fit, 'r-', linewidth=2, 
-                 label=f'Exp Fit (Decay: {decay_rate:.2f} $s^{{-1}}$)')
+                 label=f'Mixed Fit\nViscous: {viscous_rate:.2f} $s^{{-1}}$\nCoulomb: {coulomb_rate:.2f} $rad/s^2$')
 
     plt.title(f'Trial {idx}: Coast-Down Profile')
     plt.xlabel('Time since Torque Cut (s)')
@@ -211,12 +245,16 @@ def main():
     print(f"\n[INFO] Generating summary reports...")
     
     plt.figure(figsize=(10, 6))
-    valid_decays = []
+    valid_viscous = []
+    valid_coulomb = []
     
     for i, d in enumerate(all_trial_data):
         plt.plot(d['time'], d['vel'], alpha=0.6, label=f'Trial {i+1}')
-        if d['decay_rate'] is not None:
-            valid_decays.append(d['decay_rate'])
+        
+        # Collect valid rates for the statistical summary
+        if d['viscous_rate'] is not None and d['coulomb_rate'] is not None:
+            valid_viscous.append(d['viscous_rate'])
+            valid_coulomb.append(d['coulomb_rate'])
             
     plt.title(f"Actuator {TEST_MOTOR_ID}: Coast-Down Comparison")
     plt.xlabel("Time (s)")
@@ -225,15 +263,40 @@ def main():
     plt.legend()
     plt.savefig(os.path.join(session_dir, "summary_overlaid_trials.png"))
     
-    if valid_decays:
-        mean_decay = np.mean(valid_decays)
-        std_decay = np.std(valid_decays)
+    if valid_viscous and valid_coulomb:
+        mean_visc_rate = np.mean(valid_viscous)
+        std_visc_rate = np.std(valid_viscous)
+        mean_coul_rate = np.mean(valid_coulomb)
+        std_coul_rate = np.std(valid_coulomb)
+
         print(f"\n[STATISTICAL SUMMARY]")
-        print("Note: Decay rate represents 'c/I' (Viscous Damping coeff / Rotor Inertia).")
-        print("Multiply by estimated Rotor Inertia (kg*m^2) to find pure 'c'.")
-        print(f"  Mean Decay Rate: {mean_decay:.4f} s^-1")
-        print(f"  Standard Deviation: {std_decay:.4f} s^-1")
-    
+        print("Note: Rates are scaled by Rotor Inertia (1/I).")
+        print(f"  Mean Viscous Rate (c/I):     {mean_visc_rate:.4f} ± {std_visc_rate:.4f} s^-1")
+        print(f"  Mean Coulomb Rate (C_dry/I): {mean_coul_rate:.4f} ± {std_coul_rate:.4f} rad/s^2")
+
+        # --- DERIVED PHYSICAL PROPERTIES ---
+        if KNOWN_COULOMB_NM_MEAN is not None:
+            # 1. Reflected Inertia (I) = C_dry_raw / Coulomb_Rate
+            mean_inertia = KNOWN_COULOMB_NM_MEAN / mean_coul_rate
+            
+            # Error propagation for I (division: combining relative errors)
+            rel_std_coulomb_raw = (KNOWN_COULOMB_NM_STD / KNOWN_COULOMB_NM_MEAN) if KNOWN_COULOMB_NM_STD else 0.0
+            rel_std_coul_rate = std_coul_rate / mean_coul_rate
+            std_inertia = mean_inertia * np.sqrt(rel_std_coulomb_raw**2 + rel_std_coul_rate**2)
+            
+            # 2. Raw Viscous Damping (c) = Viscous_Rate * I
+            mean_viscous_raw = mean_visc_rate * mean_inertia
+            
+            # Error propagation for c (multiplication: combining relative errors)
+            rel_std_visc_rate = std_visc_rate / mean_visc_rate
+            rel_std_inertia = std_inertia / mean_inertia
+            std_viscous_raw = mean_viscous_raw * np.sqrt(rel_std_visc_rate**2 + rel_std_inertia**2)
+            
+            print(f"\n[DERIVED PHYSICAL PROPERTIES]")
+            print(f"Using known static friction: {KNOWN_COULOMB_NM_MEAN:.4f} ± {(KNOWN_COULOMB_NM_STD or 0):.4f} Nm")
+            print(f"  Reflected Inertia (I):       {mean_inertia:.6f} ± {std_inertia:.6f} kg*m^2")
+            print(f"  Raw Viscous Damping (c):     {mean_viscous_raw:.6f} ± {std_viscous_raw:.6f} N*m*s/rad")
+
     print(f"\n[SUCCESS] Session data saved to: {session_dir}")
 
 if __name__ == "__main__":

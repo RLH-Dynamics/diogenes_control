@@ -35,7 +35,7 @@ from config import RS03_LIMITS, CAN_CHANNEL, HOST_ID
 TEST_MOTOR_ID = 1          # The CAN ID of the motor you wish to test
 
 # 2. Experiment Volume
-N_TRIALS = 10              # Total number of test repetitions to perform
+N_TRIALS = 100             # Total number of test repetitions to perform
 
 # 3. Torque Resolution & Limits
 TORQUE_STEP = 0.005        # Amount of torque (N.m) to add in each loop iteration
