@@ -4,9 +4,10 @@ from robstride.robstride import Robstride
 class Leg:
     # Strictly a hardware abstraction layer for the robstride actuators.
     # Does not contain previous state information -> this is handled in policy.py!
-    def __init__(self, limits: dict, channel, host_id, motor_ids):
+    def __init__(self, limits: dict, channel, host_id, motor_ids, control_mode):
         self.robstride = Robstride(channel, host_id, motor_ids)
         self.limits = limits
+        self.control_mode = control_mode
         return
     
     # Verified as  working.
@@ -15,14 +16,14 @@ class Leg:
     # We should try writing a new function to verify that this was succesful.
     def init_leg(self):
         self.robstride.init_CAN_bus()
-        self.robstride.enable_and_verify_all_MIT(limits=self.limits)
+        self.robstride.enable_and_verify_all(limits=self.limits, control_mode=self.control_mode)
     
-    def get_latest_state_vector(self, target_states: dict, kp: float, kd: float):
+    def get_latest_MIT_state_vector(self, target_states: dict, kp: float, kd: float):
         self.robstride.flush_CAN_bus()
         self.robstride.send_all_target_state_vectors(target_states=target_states, kp=kp, kd=kd, limits=self.limits)
         return self.robstride.wait_for_all_replies(limits=self.limits)
     
-    def set_output_state_vector(self, physical_targets: dict, kp: float, kd: float):
+    def set_output_MIT_state_vector(self, physical_targets: dict, kp: float, kd: float):
         self.robstride.send_all_target_state_vectors(target_states=physical_targets, kp=kp, kd=kd, limits=self.limits)
         return
     

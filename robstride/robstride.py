@@ -216,34 +216,26 @@ class Robstride:
                 limits=limits
             )
 
-    def set_output_torques(self, torque_targets: dict):
+    def set_output_torques(self, torque_targets: dict, limits: dict):
         """
         Sends target torques to all specified actuators.
-        The actuators must already be configured and verified in TORQUE (Current) mode.
-        
-        Args:
-            torque_targets (dict): Mapping of {motor_id: torque_nm}
         """
         for motor_id, torque_nm in torque_targets.items():
-            self.robstride.send_target_torque(
+            self.send_target_torque(
                 motor_id=motor_id, 
                 torque_nm=torque_nm, 
-                limits=self.limits
+                limits=limits
             )
 
-    def set_output_velocities(self, velocity_targets: dict):
+    def set_output_velocities(self, velocity_targets: dict, limits: dict):
         """
         Sends target velocities to all specified actuators.
-        The actuators must already be configured and verified in VELOCITY mode.
-        
-        Args:
-            velocity_targets (dict): Mapping of {motor_id: velocity_rads}
         """
         for motor_id, velocity_rads in velocity_targets.items():
-            self.robstride.send_target_velocity(
+            self.send_target_velocity(
                 motor_id=motor_id, 
                 velocity_rads=velocity_rads, 
-                limits=self.limits
+                limits=limits
             )
 
     def enable_and_verify_all(self, limits: dict, control_mode: str = 'MIT', timeout: float = 0.5):
@@ -273,9 +265,27 @@ class Robstride:
             self.write_parameter(motor_id, ParameterType.MODE, mode_val)
             time.sleep(0.01)
 
+        print("[INFO] Pre-loading zero-targets to ensure a limp state on startup...")
+        
+        # 2. Pipeline a zero-command BEFORE enabling. This ensures that any stale targets 
+        # saved in the motor's RAM are overwritten to 0 before power is applied to the coils.
+        for motor_id in self.motor_ids:
+            if control_mode == 'MIT':
+                self.send_target_state_vector(
+                    motor_id=motor_id, pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=0.0, limits=limits
+                )
+            elif control_mode == 'TORQUE':
+                self.send_target_torque(motor_id=motor_id, torque_nm=0.0, limits=limits)
+            elif control_mode == 'VELOCITY':
+                self.send_target_velocity(motor_id=motor_id, velocity_rads=0.0, limits=limits)
+            time.sleep(0.005)
+
         print("[INFO] Sending Enable commands to all motors...")
         
-        # 2. Send the Enable command (CommType 3) to all actuators
+        # 3. Flush any stale messages from the bus so we only listen for fresh status replies
+        self.flush_CAN_bus()
+
+        # 4. Send the Enable command (CommType 3) to all actuators
         for motor_id in self.motor_ids:
             self.transmit(
                 comm_type=CommunicationType.ENABLE,
@@ -284,23 +294,6 @@ class Robstride:
                 data=b'\x00' * 8  # Payload is ignored for Enable commands
             )
             time.sleep(0.01)
-            
-        print("[INFO] Establishing passive state and soliciting feedback...")
-        
-        # 3. Flush any stale messages from the bus
-        self.flush_CAN_bus()
-        
-        # 4. Pipeline a zero-command to ensure a limp state using the specific target functions
-        for motor_id in self.motor_ids:
-            if control_mode == 'MIT':
-                self.send_target_mit(
-                    motor_id=motor_id, pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=0.0, limits=limits
-                )
-            elif control_mode == 'TORQUE':
-                self.send_target_torque(motor_id=motor_id, torque_nm=0.0, limits=limits)
-            elif control_mode == 'VELOCITY':
-                self.send_target_velocity(motor_id=motor_id, velocity_rads=0.0, limits=limits)
-            time.sleep(0.005)
             
         print("[INFO] Waiting for state verification from all motors...")
         
@@ -411,6 +404,18 @@ class Robstride:
         and closes the CAN bus interface.
         """
         if self.bus is not None:
+
+            print("\n[INFO] Zeroing stateful parameters before shutdown...")
+            
+            # Explicitly overwrite RAM targets to 0.0 to prevent jerking on next boot
+            for motor_id in getattr(self, 'motor_ids', []):
+                try:
+                    self.write_parameter(motor_id, ParameterType.VELOCITY_TARGET, 0.0)
+                    self.write_parameter(motor_id, ParameterType.IQ_TARGET, 0.0)
+                    time.sleep(0.005)
+                except HardwareIOError:
+                    pass
+
             print("\n[INFO] Disabling all motors...")
             
             # 1. Flush bus to clear out old status messages
