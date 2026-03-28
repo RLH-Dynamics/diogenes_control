@@ -247,16 +247,16 @@ class Robstride:
         Returns:
             tuple: (position_in_radians, velocity_in_radians_per_second)
         """
-        # Read position (Parameter 0x3016)
+        # Read active mechanical position (Parameter 0x7019)
         pos = self.read_parameter(
             target_id=motor_id, 
-            parameter_tuple=ParameterType.MEASURED_POSITION_3016
+            parameter_tuple=ParameterType.MECHANICAL_POSITION
         )
         
-        # Read velocity (Parameter 0x3017)
+        # Read active mechanical velocity (Parameter 0x701B)
         vel = self.read_parameter(
             target_id=motor_id, 
-            parameter_tuple=ParameterType.MEASURED_VELOCITY_3017
+            parameter_tuple=ParameterType.MECHANICAL_VELOCITY
         )
         
         return pos, vel
