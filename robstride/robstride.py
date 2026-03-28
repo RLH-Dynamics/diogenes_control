@@ -238,6 +238,29 @@ class Robstride:
                 limits=limits
             )
 
+    def get_position_and_velocity(self, motor_id: int) -> tuple[float, float]:
+        """
+        Explicitly reads the measured position and velocity from the motor's memory.
+        This is a blocking operation useful for querying state while in TORQUE or 
+        VELOCITY modes without relying on Active Reporting or MIT mode feedback.
+        
+        Returns:
+            tuple: (position_in_radians, velocity_in_radians_per_second)
+        """
+        # Read position (Parameter 0x3016)
+        pos = self.read_parameter(
+            target_id=motor_id, 
+            parameter_tuple=ParameterType.MEASURED_POSITION_3016
+        )
+        
+        # Read velocity (Parameter 0x3017)
+        vel = self.read_parameter(
+            target_id=motor_id, 
+            parameter_tuple=ParameterType.MEASURED_VELOCITY_3017
+        )
+        
+        return pos, vel
+
     def enable_and_verify_all(self, limits: dict, control_mode: str = 'MIT', timeout: float = 0.5):
         """
         Enables all actuators, configures them to the specified control mode,
@@ -251,7 +274,9 @@ class Robstride:
         control_mode = control_mode.upper()
         
         # Map requested modes to the hardware's internal integer enumerations
-        if control_mode in ['MIT', 'TORQUE']:
+        if control_mode == 'MIT':
+            mode_val = 0
+        elif control_mode == 'TORQUE':
             mode_val = 3
         elif control_mode == 'VELOCITY':
             mode_val = 2
@@ -378,8 +403,7 @@ class Robstride:
                 if motor_id in self.motor_ids and motor_id not in received_states:
                     
                     # The payload is packed as four 16-bit unsigned integers in Big-Endian format
-                    p_int, v_int, t_int, temp_int = struct.unpack('>HHHH', r_data)
-                    
+                    p_int, v_int, t_int, temp_int = struct.unpack('>HHHh', r_data)                    
                     # Scale values back to physical units
                     pos = self._scale_u16_to_value(p_int, limits['P_MIN'], limits['P_MAX'])
                     vel = self._scale_u16_to_value(v_int, limits['V_MIN'], limits['V_MAX'])
