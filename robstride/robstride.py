@@ -70,7 +70,10 @@ class Robstride:
         
         index_bytes = struct.pack('<HH', param_index, 0x0000)
         data_bytes = struct.pack(value_format, value)
-        self.transmit(CommunicationType.WRITE_PARAMETER, self.host_id, target_id, data=index_bytes + data_bytes)
+        
+        # FIX: Pad to 8 bytes. The manual dictates Byte 4~7 holds parameter data.
+        padded_data = (index_bytes + data_bytes).ljust(8, b'\x00')
+        self.transmit(CommunicationType.WRITE_PARAMETER, self.host_id, target_id, data=padded_data)
 
     def read_parameter(self, target_id, parameter_tuple, timeout=0.1):
         """
@@ -89,13 +92,13 @@ class Robstride:
             if reply is None:
                 continue
             
-            # Unpack all 5 variables perfectly
             c_type, motor_id, dest_id, extra_data, r_data = reply
             
             # Filter for a Read Parameter reply from the specific motor, sent to our host
             if c_type == CommunicationType.READ_PARAMETER and motor_id == target_id and dest_id == self.host_id:
-                # Unpack exactly bytes 4 through 7 using the mapped format string
-                return struct.unpack(value_format, r_data[4:8])[0]
+                # FIX: Dynamically calculate the format size and slice the array accordingly
+                size = struct.calcsize(value_format)
+                return struct.unpack(value_format, r_data[4:4+size])[0]
                 
         raise HardwareIOError(f"Timeout waiting for parameter {hex(param_index)} read from Motor {target_id}")
 
@@ -153,6 +156,44 @@ class Robstride:
             destination_id=motor_id,
             data=data_payload
         )
+
+    def send_target_torque(self, motor_id: int, torque_nm: float, limits: dict, kt: float = 2.36):
+        """
+        Sends a target torque to a specific motor configured in TORQUE (Current) mode.
+        The RobStride private protocol commands torque by setting the Iq current reference.
+        
+        Args:
+            motor_id (int): CAN ID of the target motor.
+            torque_nm (float): Target torque (N.m).
+            limits (dict): Dictionary containing T_MIN and T_MAX.
+            kt (float): Motor Torque Constant (N.m/A). Default is 2.36 for the RS03.
+        """
+        # 1. Clamp the requested torque to your software config limits
+        clamped_torque = max(limits['T_MIN'], min(limits['T_MAX'], torque_nm))
+        
+        # 2. Convert N.m to Amps
+        target_amps = clamped_torque / kt
+        
+        # 3. Clamp to the hardware's absolute physical limit (43A peak per manual)
+        target_amps = max(-43.0, min(43.0, target_amps))
+        
+        # 4. Pipeline the write to the Iq Target parameter
+        self.write_parameter(motor_id, ParameterType.IQ_TARGET, target_amps)
+
+    def send_target_velocity(self, motor_id: int, velocity_rads: float, limits: dict):
+        """
+        Sends a target velocity to a specific motor configured in VELOCITY mode.
+        
+        Args:
+            motor_id (int): CAN ID of the target motor.
+            velocity_rads (float): Target velocity (rad/s).
+            limits (dict): Dictionary containing V_MIN and V_MAX.
+        """
+        # 1. Clamp the requested velocity to your software config limits
+        clamped_vel = max(limits['V_MIN'], min(limits['V_MAX'], velocity_rads))
+        
+        # 2. Pipeline the write to the Velocity Target parameter
+        self.write_parameter(motor_id, ParameterType.VELOCITY_TARGET, clamped_vel)
     
     def send_all_target_state_vectors(self, target_states: dict, kp: float, kd: float, limits: dict):
         """
@@ -175,21 +216,66 @@ class Robstride:
                 limits=limits
             )
 
-    def enable_and_verify_all_MIT(self, limits: dict, timeout: float = 0.5):
+    def set_output_torques(self, torque_targets: dict):
         """
-        Enables all actuators, forces them into a passive MIT state, and verifies 
-        their response to confirm they are active and responsive.
+        Sends target torques to all specified actuators.
+        The actuators must already be configured and verified in TORQUE (Current) mode.
+        
+        Args:
+            torque_targets (dict): Mapping of {motor_id: torque_nm}
+        """
+        for motor_id, torque_nm in torque_targets.items():
+            self.robstride.send_target_torque(
+                motor_id=motor_id, 
+                torque_nm=torque_nm, 
+                limits=self.limits
+            )
+
+    def set_output_velocities(self, velocity_targets: dict):
+        """
+        Sends target velocities to all specified actuators.
+        The actuators must already be configured and verified in VELOCITY mode.
+        
+        Args:
+            velocity_targets (dict): Mapping of {motor_id: velocity_rads}
+        """
+        for motor_id, velocity_rads in velocity_targets.items():
+            self.robstride.send_target_velocity(
+                motor_id=motor_id, 
+                velocity_rads=velocity_rads, 
+                limits=self.limits
+            )
+
+    def enable_and_verify_all(self, limits: dict, control_mode: str = 'MIT', timeout: float = 0.5):
+        """
+        Enables all actuators, configures them to the specified control mode,
+        forces them into a passive state, and verifies their response and mode.
         
         Args:
             limits (dict): Dictionary containing P_MIN, P_MAX, V_MIN, V_MAX, T_MIN, T_MAX.
+            control_mode (str): The desired control mode ('MIT', 'TORQUE', or 'VELOCITY').
             timeout (float): Max time in seconds to wait for all motors to verify.
-            
-        Raises:
-            HardwareIOError: If any expected motor fails to verify its status within the timeout.
         """
+        control_mode = control_mode.upper()
+        
+        # Map requested modes to the hardware's internal integer enumerations
+        if control_mode in ['MIT', 'TORQUE']:
+            mode_val = 3
+        elif control_mode == 'VELOCITY':
+            mode_val = 2
+        else:
+            raise ValueError(f"Invalid control mode '{control_mode}'. Supported: 'MIT', 'TORQUE', 'VELOCITY'")
+
+        print(f"[INFO] Configuring all motors to {control_mode} mode (Mode Parameter: {mode_val})...")
+        
+        # 1. Pipeline the Mode parameter write command to the bus
+        for motor_id in self.motor_ids:
+            self.write_parameter(motor_id, ParameterType.MODE, mode_val)
+            time.sleep(0.01)
+
         print("[INFO] Sending Enable commands to all motors...")
         
-        # 1. Send the Enable command (CommType 3) to all actuators
+        # 2. Send the Enable command (CommType 3) to all actuators
         for motor_id in self.motor_ids:
             self.transmit(
                 comm_type=CommunicationType.ENABLE,
@@ -197,30 +283,28 @@ class Robstride:
                 destination_id=motor_id,
                 data=b'\x00' * 8  # Payload is ignored for Enable commands
             )
-            # Give the motor ICs a moment to transition states
             time.sleep(0.01)
             
         print("[INFO] Establishing passive state and soliciting feedback...")
         
-        # 2. Flush any stale messages from the bus
+        # 3. Flush any stale messages from the bus
         self.flush_CAN_bus()
         
-        # 3. Pipeline a zero-command (kp=0, kd=0, torque=0) to ensure a limp state.
-        #    This automatically triggers an Operation Status (CommType 2) reply.
+        # 4. Pipeline a zero-command to ensure a limp state using the specific target functions
         for motor_id in self.motor_ids:
-            self.send_target_state_vector(
-                motor_id=motor_id,
-                pos=0.0,
-                vel=0.0,
-                kp=0.0,
-                kd=0.0,
-                torque=0.0,
-                limits=limits
-            )
+            if control_mode == 'MIT':
+                self.send_target_mit(
+                    motor_id=motor_id, pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=0.0, limits=limits
+                )
+            elif control_mode == 'TORQUE':
+                self.send_target_torque(motor_id=motor_id, torque_nm=0.0, limits=limits)
+            elif control_mode == 'VELOCITY':
+                self.send_target_velocity(motor_id=motor_id, velocity_rads=0.0, limits=limits)
+            time.sleep(0.005)
             
         print("[INFO] Waiting for state verification from all motors...")
         
-        # 4. Verify all expected replies are received
+        # 5. Verify all expected motor Operation Status replies are received
         verified_ids = set()
         start_time = time.perf_counter()
         
@@ -229,24 +313,35 @@ class Robstride:
             if (time.perf_counter() - start_time) > timeout:
                 missing = set(self.motor_ids) - verified_ids
                 raise HardwareIOError(
-                    f"Timeout waiting for MIT state verification. Missing replies from motors: {missing}"
+                    f"Timeout waiting for state verification. Missing replies from motors: {missing}"
                 )
                 
             reply = self.receive(timeout=0.01)
             if reply is None:
                 continue
                 
-            # Unpack the response from the receive() method
             c_type, motor_id, dest_id, extra_data, r_data = reply
             
-            # 5. Check if the reply is a valid operation status destined for our host
+            # Check if the reply is a valid operation status destined for our host
             if c_type == CommunicationType.OPERATION_STATUS and dest_id == self.host_id:
                 if motor_id in self.motor_ids:
                     verified_ids.add(motor_id)
-                    print(f"  -> Motor {motor_id}: Verified active and in passive MIT control mode.")
+
+        # 6. Actively read the MODE parameter from memory to verify it stuck successfully
+        print(f"[INFO] Polling memory to verify {control_mode} control mode...")
+        for motor_id in self.motor_ids:
+            try:
+                self.flush_CAN_bus()
+                reported_mode = self.read_parameter(motor_id, ParameterType.MODE, timeout=0.1)
+                if reported_mode != mode_val:
+                    print(f"[WARN] Motor {motor_id} reported mode {reported_mode}, expected {mode_val}.")
+                else:
+                    print(f"  -> Motor {motor_id}: Verified active and in {control_mode} control mode.")
+            except HardwareIOError as e:
+                print(f"[WARN] Failed to read mode parameter for motor {motor_id}: {e}")
                     
         print("[INFO] All motors successfully enabled, verified, and passive.")
-    
+
     # Requires flush_CAN_bus() to be appropriately called before the original outbound messages were sent that we are listening for replies.
     def wait_for_all_replies(self, limits: dict, timeout: float = 0.05) -> dict:
         """
