@@ -1,5 +1,7 @@
 import sys
 import time
+import csv
+from datetime import datetime
 import numpy as np
 from robot.leg import Leg
 from control.policy import Policy
@@ -77,6 +79,13 @@ def main():
         # --- Standard Policy Control Setup ---
         policy_hz = int(1.0 / DT)
 
+        # --- SETUP LOGGING ---
+        log_data = []
+        log_headers = ['time']
+        for mid in motor_ids:
+            log_headers.extend([f'meas_pos_{mid}', f'meas_vel_{mid}', f'cmd_pos_{mid}'])
+        # ---------------------
+
         print(f"[INFO] Entering {policy_hz}Hz Policy loop (Press Ctrl+C to stop)...")
         
         start_time = time.perf_counter()
@@ -102,6 +111,16 @@ def main():
 
             # 5. Format targets for the leg API
             current_targets = format_targets(physical_targets)
+
+            # --- LOG CURRENT STEP DATA ---
+            timestamp = loop_start - start_time
+            log_row = {'time': timestamp}
+            for mid in motor_ids:
+                log_row[f'meas_pos_{mid}'] = state_vector[mid]['pos']
+                log_row[f'meas_vel_{mid}'] = state_vector[mid]['vel']
+                log_row[f'cmd_pos_{mid}'] = current_targets[mid]['pos']
+            log_data.append(log_row)
+            # -----------------------------
 
             # 6. Send the validated output targets
             leg.set_output_state_vector(
@@ -129,6 +148,21 @@ def main():
     except Exception as e:
         print(f"\n[FATAL] An unexpected error occurred: {e}")
     finally:
+        # --- SAVE LOG DATA ---
+        if log_data:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"rl_log_{timestamp_str}.csv"
+            print(f"\n[INFO] Saving {len(log_data)} data points to {filename}...")
+            try:
+                with open(filename, mode='w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=log_headers)
+                    writer.writeheader()
+                    writer.writerows(log_data)
+                print("[INFO] Log saved successfully.")
+            except IOError as e:
+                print(f"[ERROR] Failed to save log data: {e}")
+        # ---------------------
+        
         leg.shutdown()
         sys.exit(0)
 
