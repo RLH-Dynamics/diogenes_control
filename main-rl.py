@@ -135,8 +135,8 @@ def main():
                 time.sleep(DT - elapsed)
             else:
                 # Optional: Uncomment to track real-time overruns
-                pass 
-                # print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
+                # pass 
+                print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
 
     except SafetyLimitError as e:
         print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
@@ -162,7 +162,7 @@ def main():
             except IOError as e:
                 print(f"[ERROR] Failed to save log data: {e}")
         # ---------------------
-        
+
         leg.shutdown()
         sys.exit(0)
 
