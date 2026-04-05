@@ -10,7 +10,8 @@ from utils.exceptions import HardwareIOError, ActuatorFault, HardwareError, Safe
 from config import (
     JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID, 
     KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
-    HISTORY_LEN, DEFAULT_POS, ACTION_SCALE
+    HISTORY_LEN, DEFAULT_POS, ACTION_SCALE,
+    LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL, LPF_ALPHA
 )
 
 def format_targets(target_array):
@@ -26,7 +27,8 @@ def format_targets(target_array):
     }
 
 def main():
-    print("[INFO] Setting up Leg for RL policy control loop...")
+    print(f"[INFO] Setting up Leg for dual-rate RL policy control loop...")
+    print(f"[INFO] Control Loop: {LOOP_RATE_HZ}Hz")
 
     # Extract motor IDs from the joint configuration
     motor_ids = [config['id'] for config in JOINT_CONFIG.values()]
@@ -48,7 +50,7 @@ def main():
         model_path=MODEL_PATH, 
         num_joints=NUM_JOINTS, 
         history_len=HISTORY_LEN, 
-        period=DT, 
+        period=5.0,
         default_pos=DEFAULT_POS, 
         direction_vector=direction_vector, 
         action_scale=ACTION_SCALE
@@ -71,46 +73,72 @@ def main():
         # Verify measured state is within safe operating bounds defined in JOINT_CONFIG
         safety_monitor.verify_measured_state(initial_state_vector)
 
+        # --- NEW: INITIALIZE FILTER TRACKERS ---
+        filtered_pos = {mid: initial_state_vector[mid]['pos'] for mid in motor_ids}
+        filtered_vel = {mid: initial_state_vector[mid]['vel'] for mid in motor_ids}
+
         # Pre-compute the starting position using the initial physical state
         initial_physical_targets = policy.compute_action(initial_state_vector)
         safety_monitor.validate_commanded_targets(initial_physical_targets)
         current_targets = format_targets(initial_physical_targets)
 
-        # --- Standard Policy Control Setup ---
-        policy_hz = int(1.0 / DT)
-
         # --- SETUP LOGGING ---
         log_data = []
         log_headers = ['time']
         for mid in motor_ids:
-            log_headers.extend([f'meas_pos_{mid}', f'meas_vel_{mid}', f'cmd_pos_{mid}'])
+            # We'll log raw and filtered values for visibility
+            log_headers.extend([
+                f'meas_pos_{mid}', f'meas_vel_{mid}', 
+                f'filt_pos_{mid}', f'filt_vel_{mid}',
+                f'cmd_pos_{mid}'
+            ])
         # ---------------------
 
-        print(f"[INFO] Entering {policy_hz}Hz Policy loop (Press Ctrl+C to stop)...")
+        print(f"[INFO] Entering {LOOP_RATE_HZ}Hz Control loop (Press Ctrl+C to stop)...")
         
         start_time = time.perf_counter()
+        loop_counter = 0
 
         while True:
             loop_start = time.perf_counter()
 
-            # 1. Pipeline out the previous targets and read the latest physical state
+            # 1. Pipeline out the previous targets and read the latest physical state (Runs at 200Hz)
             state_vector = leg.get_latest_state_vector(
                 target_states=current_targets, 
                 kp=KP_GAIN, 
                 kd=KD_GAIN
             )
 
-            # 2. Hard fault immediately if the robot has strayed outside physical bounds
+            # 2. Hard fault immediately if the RAW physical state has strayed outside physical bounds
             safety_monitor.verify_measured_state(state_vector)
 
-            # 3. Compute the new actions directly from the ONNX policy
-            physical_targets = policy.compute_action(state_vector)
+            # --- NEW: 3. Apply Low-Pass Filter (LPF) to positions and velocities ---
+            filtered_state_vector = {}
+            for mid in motor_ids:
+                raw_pos = state_vector[mid]['pos']
+                raw_vel = state_vector[mid]['vel']
+                
+                filtered_pos[mid] = (LPF_ALPHA * raw_pos) + ((1.0 - LPF_ALPHA) * filtered_pos[mid])
+                filtered_vel[mid] = (LPF_ALPHA * raw_vel) + ((1.0 - LPF_ALPHA) * filtered_vel[mid])
+                
+                # Construct the filtered state vector specifically for the policy
+                filtered_state_vector[mid] = {
+                    'pos': filtered_pos[mid],
+                    'vel': filtered_vel[mid]
+                }
+            # ------------------------------------------------------------------------
 
-            # 4. Validate the commanded targets before applying them
-            safety_monitor.validate_commanded_targets(physical_targets)
+            # --- NEW: 4. Compute actions only on policy ticks (50Hz) ---
+            if loop_counter % POLICY_UPDATE_INTERVAL == 0:
+                # Provide the policy with the CLEANED, FILTERED observations
+                physical_targets = policy.compute_action(filtered_state_vector)
 
-            # 5. Format targets for the leg API
-            current_targets = format_targets(physical_targets)
+                # Validate the commanded targets before applying them
+                safety_monitor.validate_commanded_targets(physical_targets)
+
+                # Format targets for the leg API
+                current_targets = format_targets(physical_targets)
+            # -----------------------------------------------------------
 
             # --- LOG CURRENT STEP DATA ---
             timestamp = loop_start - start_time
@@ -118,18 +146,20 @@ def main():
             for mid in motor_ids:
                 log_row[f'meas_pos_{mid}'] = state_vector[mid]['pos']
                 log_row[f'meas_vel_{mid}'] = state_vector[mid]['vel']
-                log_row[f'cmd_pos_{mid}'] = current_targets[mid]['pos']
+                log_row[f'filt_pos_{mid}'] = filtered_pos[mid]
+                log_row[f'filt_vel_{mid}'] = filtered_vel[mid]
+                log_row[f'cmd_pos_{mid}']  = current_targets[mid]['pos']
             log_data.append(log_row)
             # -----------------------------
 
-            # 6. Send the validated output targets
+            # 5. Send the validated output targets (Sends the held target at 200Hz)
             leg.set_output_state_vector(
                 physical_targets=current_targets, 
                 kp=KP_GAIN, 
                 kd=KD_GAIN
             )
 
-            # 7. Loop Timing Control
+            # 6. Loop Timing Control (200Hz enforcement)
             elapsed = time.perf_counter() - loop_start
             if elapsed < DT:
                 time.sleep(DT - elapsed)
@@ -137,6 +167,8 @@ def main():
                 # Optional: Uncomment to track real-time overruns
                 # pass 
                 print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
+                
+            loop_counter += 1
 
     except SafetyLimitError as e:
         print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
