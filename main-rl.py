@@ -12,7 +12,7 @@ from config import (
     KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
     HISTORY_LEN, DEFAULT_POS, ACTION_SCALE,
     LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL,
-    LPF_ALPHA, ACTION_LPF_ALPHA
+    LPF_ALPHA, ACTION_LPF_ALPHA, CYCLE_PERIOD
 )
 
 def format_targets(target_array):
@@ -51,7 +51,7 @@ def main():
         model_path=MODEL_PATH, 
         num_joints=NUM_JOINTS, 
         history_len=HISTORY_LEN, 
-        period=5.0,
+        period=CYCLE_PERIOD,
         default_pos=DEFAULT_POS, 
         direction_vector=direction_vector, 
         action_scale=ACTION_SCALE
