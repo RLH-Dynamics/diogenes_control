@@ -11,7 +11,8 @@ from config import (
     JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID, 
     KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
     HISTORY_LEN, DEFAULT_POS, ACTION_SCALE,
-    LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL, LPF_ALPHA
+    LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL,
+    LPF_ALPHA, ACTION_LPF_ALPHA
 )
 
 def format_targets(target_array):
@@ -79,8 +80,14 @@ def main():
 
         # Pre-compute the starting position using the initial physical state
         initial_physical_targets = policy.compute_action(initial_state_vector)
-        safety_monitor.validate_commanded_targets(initial_physical_targets)
-        current_targets = format_targets(initial_physical_targets)
+        
+        # --- NEW: INITIALIZE POLICY ACTION FILTER TRACKERS ---
+        # Keep track of the raw target (updated at 50Hz) and the filtered target (updated at 200Hz)
+        raw_physical_targets = np.array(initial_physical_targets, dtype=float)
+        filtered_actions = np.array(initial_physical_targets, dtype=float)
+        
+        safety_monitor.validate_commanded_targets(filtered_actions)
+        current_targets = format_targets(filtered_actions)
 
         # --- SETUP LOGGING ---
         log_data = []
@@ -128,16 +135,21 @@ def main():
                 }
             # ------------------------------------------------------------------------
 
-            # --- NEW: 4. Compute actions only on policy ticks (50Hz) ---
+            # --- NEW: 4. Compute actions on policy ticks (50Hz) ---
             if loop_counter % POLICY_UPDATE_INTERVAL == 0:
                 # Provide the policy with the CLEANED, FILTERED observations
-                physical_targets = policy.compute_action(filtered_state_vector)
+                raw_physical_targets = policy.compute_action(filtered_state_vector)
 
-                # Validate the commanded targets before applying them
-                safety_monitor.validate_commanded_targets(physical_targets)
+            # Apply LPF to policy outputs (Runs at 200Hz to smooth out the 50Hz steps)
+            for i in range(len(filtered_actions)):
+                filtered_actions[i] = (ACTION_LPF_ALPHA * raw_physical_targets[i]) + \
+                                      ((1.0 - ACTION_LPF_ALPHA) * filtered_actions[i])
 
-                # Format targets for the leg API
-                current_targets = format_targets(physical_targets)
+            # Validate the commanded targets before applying them
+            safety_monitor.validate_commanded_targets(filtered_actions)
+
+            # Format targets for the leg API
+            current_targets = format_targets(filtered_actions)
             # -----------------------------------------------------------
 
             # --- LOG CURRENT STEP DATA ---
