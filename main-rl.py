@@ -10,7 +10,7 @@ from utils.exceptions import HardwareIOError, ActuatorFault, HardwareError, Safe
 from config import (
     JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID, 
     KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
-    HISTORY_LEN, DEFAULT_POS, ACTION_SCALE,
+    DEFAULT_POS, ACTION_SCALE,
     LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL,
     LPF_ALPHA, ACTION_LPF_ALPHA, CYCLE_PERIOD
 )
@@ -50,7 +50,6 @@ def main():
     policy = Policy(
         model_path=MODEL_PATH, 
         num_joints=NUM_JOINTS, 
-        history_len=HISTORY_LEN, 
         period=CYCLE_PERIOD,
         default_pos=DEFAULT_POS, 
         direction_vector=direction_vector, 
@@ -105,6 +104,11 @@ def main():
         
         start_time = time.perf_counter()
         loop_counter = 0
+
+        # Align the policy's phase-clock origin with the start of the control loop
+        # so phi=0 coincides with the first commanded step (matches sim, where the
+        # phase derives from episode_length_buf starting at 0).
+        policy.reset_phase()
 
         while True:
             loop_start = time.perf_counter()
