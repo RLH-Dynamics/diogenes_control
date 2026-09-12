@@ -1,59 +1,49 @@
-import onnxruntime as ort
-import numpy as np
-import time
+"""ONNX actor inference.
+
+The policy is now a thin object: it owns the network, the phase clock, and the
+previous raw action, and it speaks the SIMULATION frame exclusively. Converting
+between hardware and sim frames is the Robot's job; assembling the observation
+is the ObservationBuilder's job. What is left here is inference plus the
+action transform, which is the part that genuinely belongs to the policy.
+
+The startup width check is deliberately fatal. A policy whose observation layout
+disagrees with the deploy code will still produce plausible-looking numbers, and
+those numbers drive 60 N.m actuators.
+"""
+
 import sys
+import time
+
+import numpy as np
+
+from control.observation import ObsContext, ObservationBuilder
 
 
 class Policy:
-    """Runs the MJLab-trained ONNX policy live on the robot.
+    def __init__(self, spec, model_path, term_names, action_scale, period):
+        self.spec = spec
+        self.num_joints = spec.num_joints
+        self.action_scale = action_scale
+        self.period = period
 
-    OBSERVATION LAYOUT  (must match the MJLab *actor* observation group exactly)
-    --------------------------------------------------------------------------
-    The deployed ONNX policy is the ACTOR. In env_cfgs.diogenes_env_cfg the actor
-    group is built by _proprio_terms() and then has its slider terms DELETED:
+        self.default_pos = spec.default_pos_vector()
+        self.builder = ObservationBuilder(spec, term_names)
 
-        actor_terms = _proprio_terms(...)        # joint_pos, joint_vel,
-                                                 # slider_pos, slider_vel,
-                                                 # last_action, phase_clock
-        del actor_terms["slider_pos"]            # privileged -> critic only
-        del actor_terms["slider_vel"]            # privileged -> critic only
+        # Previous RAW network output. Zeroed at reset to match sim, where the
+        # action history starts zeroed on the first inference of an episode.
+        self.last_raw_action = np.zeros(self.num_joints, dtype=np.float32)
 
-    This is an ASYMMETRIC actor-critic: the slider (carriage) state is given to
-    the value function ONLY. The deployed actor never sees it, so the robot needs
-    NO rail sensor.
+        # Velocity command, if the layout includes a command term.
+        self.command = np.zeros(3, dtype=np.float32)
 
-    With concatenate_terms=True, mjlab's ObservationManager.compute_group cats the
-    surviving terms in dict-insertion order (verified against the mjlab source:
-    torch.cat(list(group_obs.values()), dim=-1)). No Diogenes term sets
-    history_length, so there is NO history stacking. The resulting 11-dim vector
-    is:
+        # Imported here, not at module scope, so HoldPolicy (and therefore
+        # `main-rl.py --dry-run`) works on a machine with no onnxruntime.
+        try:
+            import onnxruntime as ort
+        except ImportError as e:
+            print(f"[ERROR] onnxruntime is required to load a policy: {e}")
+            sys.exit(1)
 
-        [ joint_pos_rel  (3),    # joint_pos - default_pos, order (hip, thigh, calf)
-          joint_vel_rel  (3),    # joint_vel - default_vel(=0), same order
-          last_action    (3),    # previous RAW policy action (pre scale/offset)
-          phase_clock    (2) ]   # [sin(2*pi*phi), cos(2*pi*phi)]
-
-    Conventions this code must honor (all verified against mjlab source):
-      * joint_pos_rel subtracts default_joint_pos, so `default_pos` here MUST equal
-        the sim DEFAULT_INIT pose used in training (see the DEFAULT_POS note in
-        config.py / the repo's diogenes_constants.py).
-      * The JointPositionAction uses use_default_offset=True with scale=ACTION_SCALE,
-        so the commanded ABSOLUTE joint target is  raw_action*scale + default_pos.
-      * The observation's `last_action` is `action_manager.action`, documented in
-        mjlab as the RAW policy output BEFORE per-term scale/offset. So we feed
-        back the raw network output from the previous policy tick -- NOT the
-        physical motor target. We store it in self.last_raw_action.
-      * obs_normalization=True is baked INTO the exported ONNX graph (rsl-rl wraps
-        the running mean/std normalizer as the first layer), so we feed RAW,
-        UNNORMALIZED observations.
-      * No obs scale/clip is configured on any Diogenes term, so none is applied.
-    """
-
-    # Expected flat observation width (see layout above).
-    EXPECTED_OBS_DIM = 11
-
-    def __init__(self, model_path, num_joints, period, default_pos,
-                 direction_vector, action_scale):
         print(f"[INFO] Loading model: {model_path}")
         try:
             self.session = ort.InferenceSession(model_path)
@@ -62,95 +52,95 @@ class Policy:
             print(f"[ERROR] Model load failed: {e}")
             sys.exit(1)
 
-        self.num_joints = num_joints
-        self.period = period
-        self.default_pos = np.array(default_pos, dtype=np.float32)
-        self.direction_vector = np.array(direction_vector, dtype=np.float32)
-        self.action_scale = action_scale
-
-        # Previous RAW policy action (pre scale/offset). At reset the action
-        # history in mjlab is zeroed, so we start from zeros to match the very
-        # first inference the policy saw in sim.
-        self.last_raw_action = np.zeros(num_joints, dtype=np.float32)
-
-        # Validate the ONNX input width against the layout we build. A mismatch
-        # almost always means the policy was trained with a different obs set
-        # (e.g. slider re-enabled on the actor, or a history buffer added) and
-        # MUST be reconciled before running on hardware.
+        print(self.builder.describe())
         self._verify_input_dim()
-
         self.start_time = time.perf_counter()
 
     def _verify_input_dim(self):
-        """Hard-check the model's expected input width matches our layout."""
+        expected = self.builder.total_width
         try:
-            shape = self.session.get_inputs()[0].shape  # e.g. [1, 11] or ['b', 11]
-            width = shape[-1]
+            width = self.session.get_inputs()[0].shape[-1]
         except Exception as e:
             print(f"[WARN] Could not introspect model input shape: {e}")
             return
-        if isinstance(width, int) and width != self.EXPECTED_OBS_DIM:
+
+        if isinstance(width, int) and width != expected:
             print(
-                f"[ERROR] Model expects obs width {width}, but this deploy code "
-                f"builds {self.EXPECTED_OBS_DIM} "
-                f"(joint_pos_rel 3 + joint_vel_rel 3 + last_action 3 + phase 2). "
-                f"The observation layout does NOT match the trained policy. "
-                f"Refusing to run with a mismatched observation vector."
+                f"\n[ERROR] Observation width mismatch.\n"
+                f"  ONNX model expects : {width}\n"
+                f"  This layout builds : {expected}\n"
+                f"{self.builder.describe()}\n"
+                f"The deployed observation layout does not match the trained "
+                f"policy. Update OBSERVATION_TERMS in config.py to match the "
+                f"training environment's actor observation group. Refusing to "
+                f"run with a mismatched observation vector."
             )
             sys.exit(1)
-        print(f"[INFO] Observation width OK ({self.EXPECTED_OBS_DIM} dims).")
+        print(f"[INFO] Observation width OK ({expected} dims).")
 
-    def reset_phase(self):
-        """Reset the phase clock origin and action history (call before a run)."""
+    def reset(self):
+        """Reset the phase-clock origin and action history before a run."""
         self.start_time = time.perf_counter()
         self.last_raw_action = np.zeros(self.num_joints, dtype=np.float32)
 
-    def compute_action(self, state_vector):
-        # 1. Extract and sort raw hardware states by motor ID. Sorting by key
-        #    matches the (hip, thigh, calf) model-declaration order, since the
-        #    JOINT_CONFIG ids are hip=1, thigh=2, knee/calf=3.
-        sorted_keys = sorted(state_vector.keys())
-        raw_pos = np.array([state_vector[k]['pos'] for k in sorted_keys],
-                           dtype=np.float32)
-        raw_vel = np.array([state_vector[k]['vel'] for k in sorted_keys],
-                           dtype=np.float32)
+    def set_command(self, vx: float = 0.0, vy: float = 0.0, wz: float = 0.0):
+        self.command = np.array([vx, vy, wz], dtype=np.float32)
 
-        # 2. Input transform (real -> sim): apply the per-joint direction flip,
-        #    then make position RELATIVE to the default pose (joint_pos_rel).
-        #    joint_vel_rel subtracts default_vel which is 0, so velocity is just
-        #    the sim-frame velocity.
-        sim_pos = raw_pos * self.direction_vector
-        sim_vel = raw_vel * self.direction_vector
-        rel_pos = sim_pos - self.default_pos          # joint_pos_rel   (3,)
-        rel_vel = sim_vel                             # joint_vel_rel   (3,)
-
-        # 3. Phase clock: sin/cos of the global hop phase, advancing with
-        #    wall-clock time and wrapping every `period` seconds. Matches
-        #    diogenes_mdp.phase_clock (angle = 2*pi*phi, phi = t/period mod 1).
+    def phase(self) -> np.ndarray:
+        """[sin, cos] of the global hop phase, wrapping every `period` seconds."""
         elapsed = time.perf_counter() - self.start_time
         angle = 2.0 * np.pi * (elapsed / self.period)
-        phase_signal = [np.sin(angle), np.cos(angle)]   # (2,)
+        return np.array([np.sin(angle), np.cos(angle)], dtype=np.float32)
 
-        # 4. Assemble the observation in the EXACT trained order. No history.
-        obs = np.concatenate([
-            rel_pos,                                 # 0:3  joint_pos_rel
-            rel_vel,                                 # 3:6  joint_vel_rel
-            self.last_raw_action,                    # 6:9  last_action (raw)
-            np.asarray(phase_signal, dtype=np.float32),  # 9:11 phase_clock
-        ]).astype(np.float32).reshape(1, -1)
+    def act(self, sim_pos, sim_vel, imu_sample=None) -> np.ndarray:
+        """Run one policy tick. Takes and returns SIM-frame joint positions."""
+        if imu_sample is not None:
+            ang_vel = np.asarray(imu_sample.ang_vel, dtype=np.float32)
+            proj_g = np.asarray(imu_sample.projected_gravity, dtype=np.float32)
+        else:
+            ang_vel = np.zeros(3, dtype=np.float32)
+            proj_g = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
-        # 5. Inference (normalization is inside the ONNX graph; feed raw obs).
-        raw_actions = self.session.run(None, {self.input_name: obs})[0][0]
-        raw_actions = np.asarray(raw_actions, dtype=np.float32)
+        ctx = ObsContext(
+            sim_pos=np.asarray(sim_pos, dtype=np.float32),
+            sim_vel=np.asarray(sim_vel, dtype=np.float32),
+            default_pos=self.default_pos,
+            last_raw_action=self.last_raw_action,
+            base_ang_vel=ang_vel,
+            projected_gravity=proj_g,
+            phase=self.phase(),
+            commands=self.command,
+        )
 
-        # 6. Store this step's RAW action for next step's last_action observation
-        #    (mjlab feeds back the pre-scale/offset network output).
+        obs = self.builder.build(ctx)
+        raw_actions = np.asarray(
+            self.session.run(None, {self.input_name: obs})[0][0], dtype=np.float32
+        )
+
+        # Feed back the PRE-scale/offset network output, as mjlab does.
         self.last_raw_action = raw_actions.copy()
 
-        # 7. Output transform (sim -> real): apply scale + default offset
-        #    (use_default_offset=True), then the per-joint direction flip back to
-        #    hardware frame.
-        target_pos_sim = raw_actions * self.action_scale + self.default_pos
-        physical_targets = target_pos_sim * self.direction_vector
+        # use_default_offset=True: the absolute target is scale*action + default.
+        return raw_actions * self.action_scale + self.default_pos
 
-        return physical_targets
+
+class HoldPolicy:
+    """Stand-in that always commands the default pose.
+
+    Lets the full loop -- CAN exchange, safety interlocks, IMU staleness checks,
+    logging and timing -- be exercised on hardware before the retrained ONNX
+    exists. `main-rl.py --dry-run` selects it.
+    """
+
+    def __init__(self, spec):
+        self.spec = spec
+        self.default_pos = spec.default_pos_vector()
+
+    def reset(self):
+        pass
+
+    def set_command(self, vx=0.0, vy=0.0, wz=0.0):
+        pass
+
+    def act(self, sim_pos, sim_vel, imu_sample=None) -> np.ndarray:
+        return self.default_pos

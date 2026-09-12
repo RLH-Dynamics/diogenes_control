@@ -1,94 +1,97 @@
+"""Set the mechanical zero position of the actuators.
+
+WARNING: this overwrites the motors' internal zero. Hold the robot physically
+still at the intended zero pose before confirming.
+
+Now scoped: `--leg left` or `--joint left_calf` zeroes a subset, which matters
+with two legs since you will usually be jigging one at a time.
+"""
+
+import argparse
 import sys
 import time
-from robot.leg import Leg
+
+from config import SPEC
+from robot.session import RobotSession
 from robstride.protocol import CommunicationType
-from config import JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID
+from utils.exceptions import HardwareError
+
+GREEN, RED, RESET = '\033[92m', '\033[91m', '\033[0m'
+TOLERANCE_RAD = 0.05
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Set actuator mechanical zero.")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--leg', choices=SPEC.leg_names,
+                   help="Zero only this leg's joints.")
+    g.add_argument('--joint', choices=SPEC.names, action='append',
+                   help="Zero only this joint (repeatable).")
+    p.add_argument('--yes', action='store_true', help="Skip the confirmation prompt.")
+    return p.parse_args()
+
+
+def selected_joints(args):
+    if args.leg:
+        return SPEC.joints_in_leg(args.leg)
+    if args.joint:
+        return [SPEC.joint(n) for n in args.joint]
+    return list(SPEC.joints)
+
 
 def main():
+    args = parse_args()
+    targets = selected_joints(args)
+
     print("--- RobStride RS03 Zero Point Setter ---")
-    print("WARNING: This will overwrite the internal mechanical zero position of the motors.")
-    print("Ensure the robot leg is physically held perfectly still at the desired zero coordinates.")
-    
-    confirm = input("Type 'YES' to proceed: ")
-    if confirm != "YES":
+    print("WARNING: this overwrites the internal mechanical zero position.")
+    print("Ensure the following joints are held still at the desired zero:")
+    for j in targets:
+        print(f"  - {j.name}  ({j.bus}, id {j.can_id})")
+
+    if not args.yes and input("\nType 'YES' to proceed: ") != "YES":
         print("Aborting.")
         sys.exit(0)
 
-    # 1. Extract motor IDs from the joint configuration
-    motor_ids = [config['id'] for config in JOINT_CONFIG.values()]
-    
-    # 2. Instantiate the Leg class
-    leg = Leg(
-        limits=RS03_LIMITS, 
-        channel=CAN_CHANNEL, 
-        host_id=HOST_ID, 
-        motor_ids=motor_ids
-    )
-
     try:
-        # Initialize the hardware (starts CAN, enables motors into a passive state)
-        leg.init_leg()
-        print("\n[INFO] Initialization complete. Motors are enabled and passive.")
-        
-        # 3. Iterate through joints and set zero
-        print("\n[INFO] Transmitting SET_ZERO_POSITION commands...")
-        for motor_id in sorted(motor_ids):
-            print(f"  -> Sending zero command to Motor ID {motor_id}...")
-            
-            # Send Communication Type 6 with Byte[0] = 1 as the trigger payload
-            leg.robstride.transmit(
-                comm_type=CommunicationType.SET_ZERO_POSITION,
-                extra_data=HOST_ID,
-                destination_id=motor_id,
-                data=b'\x01\x00\x00\x00\x00\x00\x00\x00'
-            )
-            
-            # Short sleep to allow the motor's MCU to process the command and flash memory
-            time.sleep(0.5)
+        with RobotSession(SPEC, use_imu=False, realtime=False) as robot:
+            print("\n[INFO] Transmitting SET_ZERO_POSITION commands...")
+            for joint in targets:
+                print(f"  -> {joint.name} ({joint.bus}, id {joint.can_id})...")
+                robot.network.buses[joint.bus].transmit(
+                    comm_type=CommunicationType.SET_ZERO_POSITION,
+                    extra_data=SPEC.host_id,
+                    destination_id=joint.can_id,
+                    data=b'\x01\x00\x00\x00\x00\x00\x00\x00',
+                )
+                # Let the motor MCU process the command and flash it.
+                time.sleep(0.5)
 
-        # 4. Verification Step
-        print("\n[INFO] Verifying new mechanical zero positions...")
-        
-        # Define a zeroed target state vector to safely query the leg without movement
-        zero_targets = {mid: {'pos': 0.0, 'vel': 0.0, 'torque': 0.0} for mid in motor_ids}
-        
-        # Flush the CAN bus and get the latest state vector
-        state_vector = leg.get_latest_state_vector(
-            target_states=zero_targets, 
-            kp=0.0, 
-            kd=0.0
-        )
-        
-        # Check that the reported position is ~0.0 rad
-        all_zeroed = True
-        TOLERANCE = 0.05 # radians
+            print("\n[INFO] Verifying new mechanical zero positions...")
+            state = robot.read_limp_state(timeout=0.05)
 
-        GREEN = '\033[92m'
-        RED = '\033[91m'
-        RESET = '\033[0m'
-        
-        for motor_id in sorted(motor_ids):
-            state = state_vector.get(motor_id, {})
-            pos = state.get('pos', 999.0) # Default to a clearly wrong number if missing
-            
-            if abs(pos) <= TOLERANCE:
-                print(f"  {GREEN}[SUCCESS]{RESET} Motor ID {motor_id}: {pos:>8.4f} rad")
+            all_zeroed = True
+            for joint in targets:
+                pos = state[joint.name]['pos']
+                if abs(pos) <= TOLERANCE_RAD:
+                    print(f"  {GREEN}[SUCCESS]{RESET} {joint.name:<14}{pos:>9.4f} rad")
+                else:
+                    print(f"  {RED}[FAIL]{RESET}    {joint.name:<14}{pos:>9.4f} rad "
+                          f"(exceeds {TOLERANCE_RAD} rad tolerance)")
+                    all_zeroed = False
+
+            if all_zeroed:
+                print(f"\n{GREEN}[DONE] All selected motors zeroed and verified.{RESET}")
+                print("Power cycle the motors to confirm the calibration persisted.")
             else:
-                print(f"  {RED}[FAIL]{RESET}    Motor ID {motor_id}: {pos:>8.4f} rad (Exceeds {TOLERANCE} rad tolerance!)")
-                all_zeroed = False
-                
-        if all_zeroed:
-            print(f"\n{GREEN}[DONE] All motors successfully zeroed and verified.{RESET}")
-            print("You may need to power cycle the motors to ensure the calibration is permanently saved.")
-        else:
-            print(f"\n{RED}[CRITICAL ERROR] One or more motors failed to verify their zero position.{RESET}")
+                print(f"\n{RED}[ERROR] One or more motors failed to verify.{RESET}")
+                sys.exit(1)
 
-    except Exception as e:
-        print(f"\n{RED}[FATAL] An unexpected error occurred: {e}{RESET}")
-    finally:
-        # 5. Gracefully shut down the leg and close the CAN bus
-        leg.shutdown()
-        sys.exit(0)
+    except HardwareError as e:
+        print(f"\n{RED}[CRITICAL] Hardware failure: {e}{RESET}")
+        sys.exit(3)
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

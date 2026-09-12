@@ -1,46 +1,11 @@
 import math
 import numpy as np
+from robot.kinematics import calculate_leg_ik
+
 import matplotlib
 matplotlib.use('Qt5Agg') # Using the working Qt5 backend
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
-
-# --- 1. Inverse Kinematics ---
-def calculate_leg_ik(x, y, z, is_left_stance=True, knee_forward=True):
-    """Calculates IK angles (q1, q2, q3) given foot target (x,y,z)."""
-    xz_dist_sq = x**2 + z**2
-    if xz_dist_sq < 6.25: 
-        xz_dist_sq = 6.25
-        
-    yaw_offset_angle = math.acos(-2.5 / math.sqrt(xz_dist_sq))
-    
-    if is_left_stance:
-        q1 = math.atan2(z, x) + yaw_offset_angle
-    else:
-        q1 = math.atan2(z, x) - yaw_offset_angle
-        
-    y_prime = y - 88.5
-    z_prime = z * math.cos(q1) - x * math.sin(q1)
-    
-    L_diag_sq = y_prime**2 + z_prime**2
-    D = (L_diag_sq - 102500.0) / 100000.0
-    D = max(-1.0, min(1.0, D))
-    
-    knee_inner_angle = math.acos(D)
-    calf_offset = 3.0 * math.pi / 4.0
-    
-    if knee_forward:
-        q3 = knee_inner_angle - calf_offset
-    else:
-        q3 = -knee_inner_angle - calf_offset
-        
-    phi = -q3 - calf_offset
-    k1 = 200.0 + 250.0 * math.cos(phi)
-    k2 = 250.0 * math.sin(phi)
-    
-    q2 = math.atan2(z_prime, y_prime) - math.atan2(k2, k1)
-    
-    return q1, q2, q3
 
 # --- 2. Forward Kinematics (For Plotting) ---
 def Rx(theta):

@@ -1,218 +1,189 @@
+"""Run the RL policy on hardware.
+
+SINGLE-RATE LOOP
+----------------
+The policy and the actuator command stream both run at config.LOOP_RATE_HZ
+(50 Hz). The previous dual-rate arrangement -- a 200 Hz command loop with
+low-pass filters on the measured position, measured velocity and policy output,
+wrapped around a 50 Hz policy tick -- has been removed. The filters were running
+with alpha = 1.0 (pass-through) in any case, and the extra rate added bus traffic
+without adding control authority.
+
+CYCLE STRUCTURE
+---------------
+Each cycle sends setpoints twice, on purpose:
+
+  1. `exchange()` re-sends the setpoints computed last cycle and collects the
+     status replies they trigger. Re-sending the currently-active command is a
+     no-op mechanically, and the OPERATION_CONTROL frame is what makes the
+     actuators report.
+  2. `send()` applies the freshly computed setpoints immediately.
+
+That keeps sensor-to-actuator latency at a couple of milliseconds instead of a
+full 20 ms cycle, which matters because the policy was trained with the action
+applied in the same step its observation was taken.
+"""
+
+import argparse
+import dataclasses
 import sys
 import time
-import csv
-from datetime import datetime
-import numpy as np
-from robot.leg import Leg
-from control.policy import Policy
-from utils.safety import SafetyMonitor
-from utils.exceptions import HardwareIOError, ActuatorFault, HardwareError, SafetyLimitError
-from config import (
-    JOINT_CONFIG, RS03_LIMITS, CAN_CHANNEL, HOST_ID, 
-    KP_GAIN, KD_GAIN, DT, MODEL_PATH, NUM_JOINTS, 
-    DEFAULT_POS, ACTION_SCALE,
-    LOOP_RATE_HZ, DT, POLICY_UPDATE_INTERVAL,
-    LPF_ALPHA, ACTION_LPF_ALPHA, CYCLE_PERIOD
-)
 
-def format_targets(target_array):
-    """
-    Helper function to convert the policy's flat array output into the 
-    dictionary structure expected by the robstride leg commands.
-    """
-    # Sort motor configs by ID to match the sorting in policy.py
-    sorted_configs = sorted(JOINT_CONFIG.values(), key=lambda x: x['id'])
-    return {
-        config['id']: {'pos': float(target_array[i]), 'vel': 0.0, 'torque': 0.0} 
-        for i, config in enumerate(sorted_configs)
-    }
+from config import (
+    ACTION_SCALE, CYCLE_PERIOD, MODEL_PATH, OBSERVATION_TERMS, SPEC,
+)
+from control.policy import HoldPolicy, Policy
+from robot.session import RobotSession
+from utils.exceptions import (
+    ActuatorFault, HardwareError, HardwareIOError, SafetyLimitError,
+)
+from utils.realtime import LoopPacer, restore_gc
+from utils.recorder import Recorder
+from utils.safety import SafetyMonitor
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Run the RL policy on the robot.")
+    p.add_argument('--model', default=MODEL_PATH,
+                   help="Path to the ONNX actor (default: %(default)s)")
+    p.add_argument('--dry-run', action='store_true',
+                   help="Command the default pose instead of loading a policy. "
+                        "Exercises CAN, IMU, safety, timing and logging without "
+                        "a trained model.")
+    p.add_argument('--no-imu', action='store_true',
+                   help="Run with a synthetic level IMU (bench use only).")
+    p.add_argument('--duration', type=float, default=None,
+                   help="Stop automatically after this many seconds.")
+    p.add_argument('--log-prefix', default='rl_log',
+                   help="Filename prefix for the CSV log (default: %(default)s)")
+    p.add_argument('--no-log', action='store_true', help="Disable CSV logging.")
+    p.add_argument('--virtual', action='store_true',
+                   help="Run against tools/fake_motors.py over an in-process "
+                        "virtual CAN bus. No hardware required; implies --no-imu.")
+    return p.parse_args()
+
+
+def build_spec(virtual: bool):
+    """The configured robot, optionally rebound to the virtual CAN backend."""
+    if not virtual:
+        return SPEC, None
+    buses = [dataclasses.replace(b, interface="virtual") for b in SPEC.buses]
+    spec = dataclasses.replace(SPEC, buses=buses)
+    from tools.fake_motors import FakeRobot
+    return spec, FakeRobot(spec)
+
 
 def main():
-    print(f"[INFO] Setting up Leg for dual-rate RL policy control loop...")
-    print(f"[INFO] Control Loop: {LOOP_RATE_HZ}Hz")
+    args = parse_args()
+    spec, simulator = build_spec(args.virtual)
+    use_imu = not (args.no_imu or args.virtual)
 
-    # Extract motor IDs from the joint configuration
-    motor_ids = [config['id'] for config in JOINT_CONFIG.values()]
-    
-    # Instantiate the Leg class
-    leg = Leg(
-        limits=RS03_LIMITS,
-        channel=CAN_CHANNEL,
-        host_id=HOST_ID,
-        motor_ids=motor_ids
-    )
-    
-    # Instantiate the Safety Monitor
-    safety_monitor = SafetyMonitor(joint_limits=JOINT_CONFIG)
+    print(f"[INFO] RL control loop at {spec.loop_rate_hz:g} Hz "
+          f"({spec.dt * 1000:.1f} ms per cycle)")
+    if simulator is not None:
+        print("[INFO] VIRTUAL: running against simulated actuators.")
+        simulator.start()
 
-    # Instantiate the RL Policy
-    direction_vector = [config['direction'] for config in sorted(JOINT_CONFIG.values(), key=lambda x: x['id'])]
-    policy = Policy(
-        model_path=MODEL_PATH, 
-        num_joints=NUM_JOINTS, 
-        period=CYCLE_PERIOD,
-        default_pos=DEFAULT_POS, 
-        direction_vector=direction_vector, 
-        action_scale=ACTION_SCALE
-    )
-
-    try:
-        # Initialize the hardware
-        leg.init_leg()
-        print("[INFO] Initialization complete.")
-
-        # Read the initial zero state to verify the robot is safely communicative before starting
-        print("[INFO] Checking initial hardware state...")
-        zero_targets = {mid: {'pos': 0.0, 'vel': 0.0, 'torque': 0.0} for mid in motor_ids}
-        initial_state_vector = leg.get_latest_state_vector(
-            target_states=zero_targets, 
-            kp=0.0, 
-            kd=0.0
+    if args.dry_run:
+        print("[INFO] DRY RUN: commanding the default pose, no policy loaded.")
+        policy = HoldPolicy(spec)
+    else:
+        policy = Policy(
+            spec=spec,
+            model_path=args.model,
+            term_names=OBSERVATION_TERMS,
+            action_scale=ACTION_SCALE,
+            period=CYCLE_PERIOD,
         )
-        
-        # Verify measured state is within safe operating bounds defined in JOINT_CONFIG
-        safety_monitor.verify_measured_state(initial_state_vector)
 
-        # --- NEW: INITIALIZE FILTER TRACKERS ---
-        filtered_pos = {mid: initial_state_vector[mid]['pos'] for mid in motor_ids}
-        filtered_vel = {mid: initial_state_vector[mid]['vel'] for mid in motor_ids}
+    safety = SafetyMonitor(spec)
+    recorder = None if args.no_log else Recorder(spec)
+    pacer = LoopPacer(spec.dt)
 
-        # Pre-compute the starting position using the initial physical state
-        initial_physical_targets = policy.compute_action(initial_state_vector)
-        
-        # --- NEW: INITIALIZE POLICY ACTION FILTER TRACKERS ---
-        # Keep track of the raw target (updated at 50Hz) and the filtered target (updated at 200Hz)
-        raw_physical_targets = np.array(initial_physical_targets, dtype=float)
-        filtered_actions = np.array(initial_physical_targets, dtype=float)
-        
-        safety_monitor.validate_commanded_targets(filtered_actions)
-        current_targets = format_targets(filtered_actions)
+    exit_code = 0
+    try:
+        with RobotSession(spec, use_imu=use_imu) as robot:
+            # Confirm the robot is communicative and within bounds while limp,
+            # before any gain is applied.
+            print("[INFO] Checking initial hardware state...")
+            state = robot.read_limp_state()
+            safety.verify_measured_state(state)
 
-        # --- SETUP LOGGING ---
-        log_data = []
-        log_headers = ['time']
-        for mid in motor_ids:
-            # We'll log raw and filtered values for visibility
-            log_headers.extend([
-                f'meas_pos_{mid}', f'meas_vel_{mid}', 
-                f'filt_pos_{mid}', f'filt_vel_{mid}',
-                f'cmd_pos_{mid}'
-            ])
-        # ---------------------
+            imu_sample = robot.read_imu()
+            safety.verify_imu_sample(imu_sample)
+            print(f"[INFO] Base tilt at start: "
+                  f"{imu_sample.tilt_rad * 57.2958:.1f} deg")
 
-        print(f"[INFO] Entering {LOOP_RATE_HZ}Hz Control loop (Press Ctrl+C to stop)...")
-        
-        start_time = time.perf_counter()
-        loop_counter = 0
+            # Start from where the robot actually is, so the first commanded
+            # step does not yank the joints toward the default pose.
+            targets = robot.hold_targets(state)
 
-        # Align the policy's phase-clock origin with the start of the control loop
-        # so phi=0 coincides with the first commanded step (matches sim, where the
-        # phase derives from episode_length_buf starting at 0).
-        policy.reset_phase()
+            print("[INFO] Entering control loop (Ctrl+C to stop)...")
+            policy.reset()
+            start_time = time.perf_counter()
+            pacer.start()
+            overrun_s = 0.0
 
-        while True:
-            loop_start = time.perf_counter()
+            while True:
+                # 1. Apply last cycle's setpoints and collect the state they
+                #    provoke.
+                state = robot.exchange(targets)
+                robot.check_faults()
+                safety.verify_measured_state(state)
 
-            # 1. Pipeline out the previous targets and read the latest physical state (Runs at 200Hz)
-            state_vector = leg.get_latest_state_vector(
-                target_states=current_targets, 
-                kp=KP_GAIN, 
-                kd=KD_GAIN
-            )
+                # 2. Base state. Never blocks; staleness is a hard fault.
+                imu_sample = robot.read_imu()
+                safety.verify_imu_sample(imu_sample)
 
-            # 2. Hard fault immediately if the RAW physical state has strayed outside physical bounds
-            safety_monitor.verify_measured_state(state_vector)
+                # 3. Policy tick, entirely in the sim frame.
+                sim_pos, sim_vel = robot.to_sim_frame(*robot.state_arrays(state))
+                sim_targets = policy.act(sim_pos, sim_vel, imu_sample)
 
-            # --- NEW: 3. Apply Low-Pass Filter (LPF) to positions and velocities ---
-            filtered_state_vector = {}
-            for mid in motor_ids:
-                raw_pos = state_vector[mid]['pos']
-                raw_vel = state_vector[mid]['vel']
-                
-                filtered_pos[mid] = (LPF_ALPHA * raw_pos) + ((1.0 - LPF_ALPHA) * filtered_pos[mid])
-                filtered_vel[mid] = (LPF_ALPHA * raw_vel) + ((1.0 - LPF_ALPHA) * filtered_vel[mid])
-                
-                # Construct the filtered state vector specifically for the policy
-                filtered_state_vector[mid] = {
-                    'pos': filtered_pos[mid],
-                    'vel': filtered_vel[mid]
-                }
-            # ------------------------------------------------------------------------
+                # 4. Back to the hardware frame, and validate before it can move
+                #    anything.
+                hw_targets = robot.to_hardware_frame(sim_targets)
+                safety.validate_commanded_targets(hw_targets)
+                targets = robot.targets_from_array(hw_targets)
 
-            # --- NEW: 4. Compute actions on policy ticks (50Hz) ---
-            if loop_counter % POLICY_UPDATE_INTERVAL == 0:
-                # Provide the policy with the CLEANED, FILTERED observations
-                raw_physical_targets = policy.compute_action(filtered_state_vector)
+                # 5. Apply this cycle's setpoints now rather than next cycle.
+                robot.send(targets)
 
-            # Apply LPF to policy outputs (Runs at 200Hz to smooth out the 50Hz steps)
-            for i in range(len(filtered_actions)):
-                filtered_actions[i] = (ACTION_LPF_ALPHA * raw_physical_targets[i]) + \
-                                      ((1.0 - ACTION_LPF_ALPHA) * filtered_actions[i])
+                now = time.perf_counter()
+                if recorder is not None:
+                    recorder.record(
+                        t=now - start_time,
+                        state=state,
+                        targets=targets,
+                        imu_sample=imu_sample,
+                        exchange_s=robot.network.last_exchange_s,
+                        overrun_s=overrun_s,
+                    )
 
-            # Validate the commanded targets before applying them
-            safety_monitor.validate_commanded_targets(filtered_actions)
+                if args.duration is not None and (now - start_time) >= args.duration:
+                    print(f"\n[INFO] Reached {args.duration:.1f} s limit.")
+                    break
 
-            # Format targets for the leg API
-            current_targets = format_targets(filtered_actions)
-            # -----------------------------------------------------------
-
-            # --- LOG CURRENT STEP DATA ---
-            timestamp = loop_start - start_time
-            log_row = {'time': timestamp}
-            for mid in motor_ids:
-                log_row[f'meas_pos_{mid}'] = state_vector[mid]['pos']
-                log_row[f'meas_vel_{mid}'] = state_vector[mid]['vel']
-                log_row[f'filt_pos_{mid}'] = filtered_pos[mid]
-                log_row[f'filt_vel_{mid}'] = filtered_vel[mid]
-                log_row[f'cmd_pos_{mid}']  = current_targets[mid]['pos']
-            log_data.append(log_row)
-            # -----------------------------
-
-            # 5. Send the validated output targets (Sends the held target at 200Hz)
-            leg.set_output_state_vector(
-                physical_targets=current_targets, 
-                kp=KP_GAIN, 
-                kd=KD_GAIN
-            )
-
-            # 6. Loop Timing Control (200Hz enforcement)
-            elapsed = time.perf_counter() - loop_start
-            if elapsed < DT:
-                time.sleep(DT - elapsed)
-            else:
-                # Optional: Uncomment to track real-time overruns
-                # pass 
-                print(f"[WARN] Loop overrun by {(elapsed - DT)*1000:.2f} ms")
-                
-            loop_counter += 1
+                overrun_s = pacer.sleep()
 
     except SafetyLimitError as e:
-        print(f"\n[EMERGENCY STOP] Safety Interlock Tripped: {e}")
+        print(f"\n[EMERGENCY STOP] Safety interlock tripped: {e}")
+        exit_code = 2
     except (HardwareIOError, ActuatorFault, HardwareError) as e:
-        print(f"\n[CRITICAL] Hardware Failure: {e}")
-        print("Initiating emergency shutdown...")
-    except KeyboardInterrupt:
-        print("\n[INFO] KeyboardInterrupt detected. Stopping RL policy...")
+        print(f"\n[CRITICAL] Hardware failure: {e}")
+        exit_code = 3
     except Exception as e:
-        print(f"\n[FATAL] An unexpected error occurred: {e}")
+        print(f"\n[FATAL] Unexpected error: {e}")
+        exit_code = 4
     finally:
-        # --- SAVE LOG DATA ---
-        if log_data:
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"rl_log_{timestamp_str}.csv"
-            print(f"\n[INFO] Saving {len(log_data)} data points to {filename}...")
-            try:
-                with open(filename, mode='w', newline='') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=log_headers)
-                    writer.writeheader()
-                    writer.writerows(log_data)
-                print("[INFO] Log saved successfully.")
-            except IOError as e:
-                print(f"[ERROR] Failed to save log data: {e}")
-        # ---------------------
+        if simulator is not None:
+            simulator.stop()
+        restore_gc()
+        print(f"[INFO] Loop timing: {pacer.summary()}")
+        if recorder is not None:
+            recorder.save(prefix=args.log_prefix)
 
-        leg.shutdown()
-        sys.exit(0)
+    sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
