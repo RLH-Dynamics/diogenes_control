@@ -16,7 +16,7 @@ import time
 import can
 
 from robstride.protocol import CommunicationType, FORMAT_MAP, ParameterType
-from utils.exceptions import ActuatorFault, HardwareIOError
+from utils.exceptions import ActuatorFault, HardwareIOError, ParameterRejected
 
 # Kp/Kd are scaled against fixed bounds defined by the RobStride manual, not
 # against the per-robot actuator limits.
@@ -153,6 +153,19 @@ class RobstrideBus:
             c_type, motor_id, dest_id, extra_data, r_data = reply
             if (c_type == CommunicationType.READ_PARAMETER
                     and motor_id == target_id and dest_id == self.host_id):
+                # Skip a late reply to some earlier read of a different index.
+                if struct.unpack('<H', r_data[0:2])[0] != param_index:
+                    continue
+                # The high byte of extra_data is a status flag: 0 = success,
+                # nonzero = the motor rejected the read (e.g. the parameter is
+                # missing from its firmware). The payload is then zero-filled.
+                status = (extra_data >> 8) & 0xFF
+                if status:
+                    raise ParameterRejected(
+                        f"[{self.channel}] motor {target_id} rejected read of "
+                        f"parameter {hex(param_index)} (status {status:#04x}); "
+                        f"not supported by its firmware?"
+                    )
                 size = struct.calcsize(value_format)
                 return struct.unpack(value_format, r_data[4:4 + size])[0]
 
@@ -178,6 +191,7 @@ class RobstrideBus:
         """
         expected = int(timeout_ms * 20)
         all_ok = True
+        no_register = []
         for mid in self.can_ids:
             try:
                 self.flush()
@@ -186,10 +200,101 @@ class RobstrideBus:
                     print(f"[WARN] [{self.channel}] motor {mid} watchdog reads "
                           f"{actual}, expected {expected}.")
                     all_ok = False
+            except ParameterRejected:
+                # Older firmware has no 0x7028, but may still time out on a
+                # stored setting. Test the behaviour directly instead.
+                no_register.append(mid)
             except HardwareIOError as e:
                 print(f"[WARN] [{self.channel}] could not verify watchdog on motor {mid}: {e}")
                 all_ok = False
+
+        if no_register:
+            print(f"[INFO] [{self.channel}] motors {no_register} have no readable "
+                  f"CAN-timeout register; testing timeout behaviour instead...")
+            results = self.verify_timeout_by_silence(no_register,
+                                                     silence_s=2 * timeout_ms / 1000)
+            for mid, ok in results.items():
+                if ok:
+                    print(f"  -> [{self.channel}] motor {mid}: disabled itself "
+                          f"within {2 * timeout_ms} ms of silence.")
+                else:
+                    all_ok = False
         return all_ok
+
+    def verify_timeout_by_silence(self, motor_ids, silence_s: float = 0.2) -> dict:
+        """Behavioural watchdog check: does each motor disable itself when the
+        host goes quiet? Returns {can_id: passed}.
+
+        Zero-force throughout. The motors are put in MIT mode with a
+        kp = kd = torque = 0 setpoint, enabled, confirmed running from the mode
+        bits of their status reply, then left without traffic for `silence_s`.
+        One more zero-force frame then asks for their state: a motor that timed
+        out reports reset mode. Every motor tested is sent DISABLE afterwards
+        whatever the outcome.
+
+        A pass proves the motor's timeout is no longer than `silence_s`; it
+        cannot tell 50 ms from 150 ms.
+        """
+        results = {}
+        try:
+            for mid in motor_ids:
+                self.write_parameter(mid, ParameterType.MODE, self.MODE_VALUES['MIT'])
+                time.sleep(0.01)
+                self._send_limp(mid)
+                time.sleep(0.005)
+            self.flush()
+            for mid in motor_ids:
+                self.transmit(CommunicationType.ENABLE, self.host_id, mid)
+                time.sleep(0.01)
+            time.sleep(0.02)
+
+            before = {mid: self._limp_probe(mid) for mid in motor_ids}
+            time.sleep(silence_s)
+            after = {mid: self._limp_probe(mid) for mid in motor_ids}
+
+            for mid in motor_ids:
+                b, a = before[mid], after[mid]
+                if b != self.MOTOR_STATE_RUN:
+                    print(f"[WARN] [{self.channel}] motor {mid}: timeout test "
+                          f"inconclusive, did not enter run mode (state {b}).")
+                    results[mid] = False
+                elif a != self.MOTOR_STATE_RESET:
+                    print(f"[WARN] [{self.channel}] motor {mid} was still enabled "
+                          f"after {silence_s * 1000:.0f} ms of silence (state {a}): "
+                          f"its CAN timeout is off or longer than that.")
+                    results[mid] = False
+                else:
+                    results[mid] = True
+        finally:
+            for mid in motor_ids:
+                try:
+                    self.transmit(CommunicationType.DISABLE, self.host_id, mid)
+                    time.sleep(0.01)
+                except HardwareIOError as e:
+                    print(f"[WARN] [{self.channel}] failed to disable motor {mid}: {e}")
+            self.flush()
+        return results
+
+    def _send_limp(self, motor_id: int):
+        self.send_target_state_vector(motor_id, pos=0.0, vel=0.0,
+                                      kp=0.0, kd=0.0, torque=0.0)
+
+    def _limp_probe(self, motor_id: int, timeout: float = 0.05):
+        """Send one zero-force frame; return the mode state from the reply, or None."""
+        self.flush()
+        self._send_limp(motor_id)
+        start_t = time.perf_counter()
+        while (time.perf_counter() - start_t) < timeout:
+            reply = self.receive(timeout=0.01)
+            if reply is None:
+                continue
+            c_type, mid, dest_id, extra_data, _ = reply
+            if (c_type == CommunicationType.OPERATION_STATUS
+                    and mid == motor_id and dest_id == self.host_id):
+                # Status frames carry the mode state in bits 22..23 of the
+                # arbitration id, i.e. bits 14..15 of extra_data.
+                return (extra_data >> 14) & 0x3
+        return None
 
     # ------------------------------------------------------------ commands --
 
@@ -292,6 +397,11 @@ class RobstrideBus:
     # -------------------------------------------------------------- enable --
 
     MODE_VALUES = {'MIT': 0, 'VELOCITY': 2, 'TORQUE': 3}
+
+    # Mode state reported in bits 22..23 of every status frame's arbitration id.
+    MOTOR_STATE_RESET = 0      # disabled
+    MOTOR_STATE_CALIBRATION = 1
+    MOTOR_STATE_RUN = 2        # enabled
 
     def enable_and_verify(self, control_mode: str = 'MIT', timeout: float = 0.5):
         """Configure mode, pre-load zero targets, enable, and verify the motors.

@@ -77,8 +77,11 @@ class RobstrideNetwork:
             self._use_select = False
 
     def verify_watchdogs(self) -> bool:
-        return all(bus.verify_hardware_watchdog(self.spec.watchdog_ms)
-                   for bus in self.buses.values())
+        # A list, not a generator: all() would stop at the first failing bus and
+        # leave the remaining buses unchecked and unreported.
+        results = [bus.verify_hardware_watchdog(self.spec.watchdog_ms)
+                   for bus in self.buses.values()]
+        return all(results)
 
     def enable(self, control_mode: str = 'MIT'):
         for bus in self.buses.values():

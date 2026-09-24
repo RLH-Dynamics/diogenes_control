@@ -57,6 +57,12 @@ def parse_args():
     p.add_argument('--log-prefix', default='rl_log',
                    help="Filename prefix for the CSV log (default: %(default)s)")
     p.add_argument('--no-log', action='store_true', help="Disable CSV logging.")
+    p.add_argument('--allow-unverified-watchdogs', action='store_true',
+                   help="Run even if some motor-side CAN timeouts cannot be "
+                        "verified, by register readback or, on firmware without "
+                        "parameter 0x7028, by the zero-force silence test. Those "
+                        "motors may NOT go limp if this process stalls -- only "
+                        "use with a hardware kill switch in reach.")
     p.add_argument('--virtual', action='store_true',
                    help="Run against tools/fake_motors.py over an in-process "
                         "virtual CAN bus. No hardware required; implies --no-imu.")
@@ -102,7 +108,8 @@ def main():
 
     exit_code = 0
     try:
-        with RobotSession(spec, use_imu=use_imu) as robot:
+        with RobotSession(spec, use_imu=use_imu,
+                          allow_unverified_watchdogs=args.allow_unverified_watchdogs) as robot:
             # Confirm the robot is communicative and within bounds while limp,
             # before any gain is applied.
             print("[INFO] Checking initial hardware state...")

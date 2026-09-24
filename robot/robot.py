@@ -11,6 +11,7 @@ import numpy as np
 from robot.leg import Leg
 from robstride.network import RobstrideNetwork
 from sensors.base import ImuSample, NullImu
+from utils.exceptions import DirectionsUnverifiedError, WatchdogUnverifiedError
 
 
 class Robot:
@@ -26,15 +27,45 @@ class Robot:
 
     # ------------------------------------------------------------ lifecycle --
 
-    def start(self, control_mode: str = 'MIT', verify_watchdogs: bool = True):
-        """Bring up every CAN channel, enable the motors, start the IMU."""
+    def start(self, control_mode: str = 'MIT', verify_watchdogs: bool = True,
+              require_watchdogs: bool = True,
+              require_verified_directions: bool = True):
+        """Bring up every CAN channel, enable the motors, start the IMU.
+
+        Refuses to enable anything unless every motor-side CAN timeout is
+        confirmed (`require_watchdogs`) and the joint direction signs were
+        verified against the loaded sim joint contract
+        (`require_verified_directions`). Only tools that never apply gain
+        (limp reads, zeroing, the mapping test) should turn these off.
+        """
         print(self.spec.describe())
+        if not self.spec.directions_verified:
+            contract = self.spec.sim_contract
+            found = contract['direction_signature'] if contract else "no contract"
+            message = (
+                "Joint direction signs were verified against sim contract "
+                f"{self.spec.directions_verified_signature}, but the loaded contract "
+                f"is {found}: the sim's joint conventions changed since. Re-run the "
+                "limp mapping test (tools/stream_joints.py + live_joint_viewer.py), "
+                "fix any `direction` in config.py, then update "
+                "DIRECTIONS_VERIFIED_SIGNATURE."
+            )
+            if require_verified_directions:
+                raise DirectionsUnverifiedError(message + " Refusing to enable.")
+            print(f"[WARN] {message} Continuing because this tool applies no gain.")
+
         self.network.open()
 
         if verify_watchdogs and not self.network.verify_watchdogs():
+            if require_watchdogs:
+                raise WatchdogUnverifiedError(
+                    "One or more motor-side CAN timeouts could not be verified "
+                    "(see warnings above), so those motors may not go limp if "
+                    "the host stops transmitting. Refusing to enable."
+                )
             print("[WARN] One or more hardware watchdogs could not be verified. "
                   "The motors may not go limp on their own if the host stops "
-                  "transmitting.")
+                  "transmitting. Continuing because this tool applies no gain.")
 
         self.network.enable(control_mode=control_mode)
         self.imu.start()

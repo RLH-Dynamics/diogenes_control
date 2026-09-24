@@ -54,7 +54,8 @@ def main():
         sys.exit(0)
 
     try:
-        with RobotSession(SPEC, use_imu=False, realtime=False) as robot:
+        with RobotSession(SPEC, use_imu=False, realtime=False,
+                          limp_only=True) as robot:
             print("\n[INFO] Transmitting SET_ZERO_POSITION commands...")
             for joint in targets:
                 print(f"  -> {joint.name} ({joint.bus}, id {joint.can_id})...")

@@ -6,6 +6,12 @@ OPERATION_STATUS frame, answers parameter reads with whatever was last written,
 and tracks enable/disable state. Joint positions relax toward the commanded
 setpoint so a control loop sees plausible, moving data.
 
+A motor can also be marked as running older firmware (`legacy_motors`): it
+rejects reads of parameters 0x7026 and up, like three of Harold's real RS03s,
+and times out after a fixed `legacy_timeout_s` whatever the host writes, or
+never if that is None. Timeouts are only simulated on those motors, so ordinary
+loop tests do not depend on host-side gaps.
+
 This exists so the ordering contract, the multi-bus gather, the safety
 interlocks, the observation layout and the logging can all be exercised on a
 laptop -- and so that a regression in any of them is catchable without powering
@@ -39,9 +45,12 @@ def _scale_from_u16(x_int, v_min, v_max):
 class FakeMotor:
     """Minimal first-order model of one actuator."""
 
-    def __init__(self, can_id, tau=0.05):
+    def __init__(self, can_id, tau=0.05, legacy=False, legacy_timeout_s=None):
         self.can_id = can_id
         self.tau = tau
+        self.legacy = legacy
+        self.legacy_timeout_s = legacy_timeout_s
+        self.last_rx = None
         self.last_t = None
         self.pos = 0.0
         self.vel = 0.0
@@ -70,14 +79,19 @@ class FakeMotor:
 class FakeMotorBus(threading.Thread):
     """Impersonates every motor on one channel."""
 
-    def __init__(self, channel, host_id, can_ids, limits, interface="virtual"):
+    def __init__(self, channel, host_id, can_ids, limits, interface="virtual",
+                 legacy_ids=(), legacy_timeout_s=None):
         super().__init__(daemon=True, name=f"fake-{channel}")
         self.channel = channel
         self.host_id = host_id
         self.limits = limits
         self.interface = interface
-        self.motors = {mid: FakeMotor(mid) for mid in can_ids}
-        self._stop = threading.Event()
+        self.motors = {
+            mid: FakeMotor(mid, legacy=mid in legacy_ids,
+                           legacy_timeout_s=legacy_timeout_s)
+            for mid in can_ids
+        }
+        self._stop_event = threading.Event()
         self.bus = None
         self.frames_seen = 0
 
@@ -86,7 +100,7 @@ class FakeMotorBus(threading.Thread):
         super().start()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=1.0)
         if self.bus is not None:
             self.bus.shutdown()
@@ -108,13 +122,14 @@ class FakeMotorBus(threading.Thread):
             _scale_to_u16(motor.torque, lim['T_MIN'], lim['T_MAX']),
             int(motor.temp * 10),
         )
-        # The motor's own id rides in the low byte of extra_data; the frame is
-        # addressed to the host.
-        self._send(CommunicationType.OPERATION_STATUS, motor.can_id,
-                   self.host_id, payload)
+        # The motor's own id rides in the low byte of extra_data and its mode
+        # state (0 reset, 2 run) in bits 14..15; the frame is addressed to the host.
+        state = 2 if motor.enabled else 0
+        self._send(CommunicationType.OPERATION_STATUS,
+                   (state << 14) | motor.can_id, self.host_id, payload)
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             msg = self.bus.recv(timeout=0.002)
             now = time.perf_counter()
 
@@ -129,6 +144,14 @@ class FakeMotorBus(threading.Thread):
             motor = self.motors.get(dest_id)
             if motor is None:
                 continue
+
+            # A real motor times out on its own clock; checking lazily on the
+            # next frame is indistinguishable from the host's side.
+            if (motor.legacy and motor.enabled and motor.legacy_timeout_s is not None
+                    and motor.last_rx is not None
+                    and now - motor.last_rx > motor.legacy_timeout_s):
+                motor.enabled = False
+            motor.last_rx = now
 
             if comm_type == CommunicationType.OPERATION_CONTROL:
                 p_u16, v_u16, kp_u16, kd_u16 = struct.unpack('>HHHH', msg.data)
@@ -153,12 +176,20 @@ class FakeMotorBus(threading.Thread):
 
             elif comm_type == CommunicationType.WRITE_PARAMETER:
                 index, _ = struct.unpack('<HH', msg.data[0:4])
+                if motor.legacy and index >= 0x7026:
+                    continue   # older firmware ignores writes it doesn't know
                 motor.parameters[index] = msg.data[4:8]
                 if index == 0x7005:   # MODE
                     motor.mode = msg.data[4]
 
             elif comm_type == CommunicationType.READ_PARAMETER:
                 index, _ = struct.unpack('<HH', msg.data[0:4])
+                if motor.legacy and index >= 0x7026:
+                    # Rejected: status flag 1 in the high byte, zero payload.
+                    self._send(CommunicationType.READ_PARAMETER,
+                               (1 << 8) | motor.can_id, self.host_id,
+                               struct.pack('<HHI', index, 0, 0))
+                    continue
                 stored = motor.parameters.get(index, b'\x00\x00\x00\x00')
                 payload = struct.pack('<HH', index, 0x0000) + stored
                 self._send(CommunicationType.READ_PARAMETER, motor.can_id,
@@ -168,7 +199,8 @@ class FakeMotorBus(threading.Thread):
 class FakeRobot:
     """Every fake bus described by a RobotSpec."""
 
-    def __init__(self, spec):
+    def __init__(self, spec, legacy_motors=(), legacy_timeout_s=None):
+        """`legacy_motors` is a collection of (channel, can_id) pairs."""
         self.spec = spec
         self.buses = [
             FakeMotorBus(
@@ -177,6 +209,8 @@ class FakeRobot:
                 can_ids=spec.can_ids_on(b.channel),
                 limits=spec.actuator_limits,
                 interface=b.interface,
+                legacy_ids={mid for ch, mid in legacy_motors if ch == b.channel},
+                legacy_timeout_s=legacy_timeout_s,
             )
             for b in spec.buses
         ]

@@ -20,6 +20,19 @@ than producing a robot that moves the wrong limb.
 
 CAN identity is `(bus, can_id)`, never `can_id` alone. Joint *names* are the key
 used everywhere above the transport layer.
+
+THE SIM JOINT CONTRACT
+----------------------
+`sim_joint_contract.json` is exported from the MJCF by diogenes_mjlab (see
+harold_biped/joint_contract.py). It records each joint's sim range and, as
+signs, what a POSITIVE angle does. `direction` signs here can only be checked on
+the real robot, so the config records the contract's `direction_signature` that
+the check was done against. `RobotSpec.directions_verified` is False whenever
+the two differ, and `Robot.start` then refuses to apply gain.
+
+Position limits are declared in the SIM frame, where they can be checked against
+the contract, and converted to the hardware frame through `direction`. A sign
+fix therefore can never leave the limits pointing the wrong way.
 """
 
 from dataclasses import dataclass, field
@@ -56,15 +69,23 @@ class JointSpec:
     # because the observation is relative to it and the action is offset by it.
     default_pos: float
 
-    # Hard safety bounds, expressed in the HARDWARE frame (what the motor
-    # reports), in radians and radians/second.
-    pos_limits: tuple[float, float]
+    # Hard position bounds in the SIM frame, radians. See `pos_limits` for the
+    # hardware-frame view the safety layer uses.
+    sim_pos_limits: tuple[float, float]
+
+    # Hard velocity bounds, radians/second. Symmetric, so frame-independent.
     vel_limits: tuple[float, float]
 
     @property
     def key(self) -> tuple[str, int]:
         """Transport-level identity: the channel plus the CAN id on it."""
         return (self.bus, self.can_id)
+
+    @property
+    def pos_limits(self) -> tuple[float, float]:
+        """Position bounds in the HARDWARE frame (what the motor reports)."""
+        a, b = (lim * self.direction for lim in self.sim_pos_limits)
+        return (min(a, b), max(a, b))
 
 
 @dataclass(frozen=True)
@@ -115,6 +136,12 @@ class RobotSpec:
     imu: Optional[ImuSpec] = None
     safety: SafetySpec = field(default_factory=SafetySpec)
     watchdog_ms: int = 100
+    # The sim joint contract (parsed JSON) and the direction_signature the
+    # `direction` signs were verified against on hardware. See module docstring.
+    sim_contract: Optional[dict] = None
+    directions_verified_signature: Optional[str] = None
+    # How far past the sim range a joint's sim_pos_limits may reach, radians.
+    sim_limit_margin: float = 0.0
 
     def __post_init__(self):
         self._validate()
@@ -152,9 +179,10 @@ class RobotSpec:
                     f"Joint '{j.name}' references unknown bus '{j.bus}'. "
                     f"Known buses: {channels}"
                 )
-            lo, hi = j.pos_limits
+            lo, hi = j.sim_pos_limits
             if lo >= hi:
-                raise ValueError(f"Joint '{j.name}' has empty pos_limits {j.pos_limits}.")
+                raise ValueError(
+                    f"Joint '{j.name}' has empty sim_pos_limits {j.sim_pos_limits}.")
             lo, hi = j.vel_limits
             if lo >= hi:
                 raise ValueError(f"Joint '{j.name}' has empty vel_limits {j.vel_limits}.")
@@ -173,16 +201,46 @@ class RobotSpec:
                 "training environment; reorder JOINTS to match it."
             )
 
-        # A joint whose hardware-frame default pose is already outside its own
-        # safety limits would trip the interlock on the first commanded step.
+        # A joint whose default pose is already outside its own safety limits
+        # would trip the interlock on the first commanded step.
         for j in self.joints:
-            hw_default = j.default_pos * j.direction
-            lo, hi = j.pos_limits
-            if not (lo <= hw_default <= hi):
+            lo, hi = j.sim_pos_limits
+            if not (lo <= j.default_pos <= hi):
                 raise ValueError(
-                    f"Joint '{j.name}' default_pos {j.default_pos} maps to hardware "
-                    f"position {hw_default:.3f} rad, outside pos_limits {j.pos_limits}."
+                    f"Joint '{j.name}' default_pos {j.default_pos} is outside "
+                    f"sim_pos_limits {j.sim_pos_limits}."
                 )
+
+        if self.sim_contract is not None:
+            self._validate_against_contract()
+
+    def _validate_against_contract(self):
+        contract = self.sim_contract['joints']
+        names = [j.name for j in self.joints]
+        if set(names) != set(contract):
+            raise ValueError(
+                "Joint names do not match the sim joint contract.\n"
+                f"  config JOINTS : {sorted(names)}\n"
+                f"  contract      : {sorted(contract)}"
+            )
+        # Limits may be tighter than the sim range, never looser than it plus
+        # the margin the config allows (a real joint can overshoot slightly).
+        margin = self.sim_limit_margin
+        for j in self.joints:
+            c_lo, c_hi = contract[j.name]['range']
+            lo, hi = j.sim_pos_limits
+            if lo < c_lo - margin - 1e-9 or hi > c_hi + margin + 1e-9:
+                raise ValueError(
+                    f"Joint '{j.name}' sim_pos_limits {j.sim_pos_limits} exceed the "
+                    f"sim range [{c_lo}, {c_hi}] plus the {margin} rad margin."
+                )
+
+    @property
+    def directions_verified(self) -> bool:
+        """True when the `direction` signs were checked against this sim contract."""
+        return (self.sim_contract is not None
+                and self.directions_verified_signature
+                == self.sim_contract['direction_signature'])
 
     # --------------------------------------------------------------- lookups
 

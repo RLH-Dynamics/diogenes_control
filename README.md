@@ -10,7 +10,7 @@ Raspberry Pi 5.
 |---|---|
 | Compute | Raspberry Pi 5 |
 | CAN | Waveshare 2-CH CAN HAT (2 × MCP2515, SPI0, isolated) |
-| Actuators | 6 × RobStride RS03 — `can0`: left leg (ids 1–3), `can1`: right leg (ids 4–6) |
+| Actuators | 6 × RobStride RS03 — `can0`: left leg, `can1`: right leg; on each bus hip = 1, thigh = 2, calf = 3 |
 | IMU | Adafruit BNO085 over I2C |
 
 Both MCP2515 controllers share the SPI0 master, so their register traffic
@@ -42,6 +42,8 @@ successful initialisations.
 source setup.sh                      # brings up can0 + can1, activates .venv
 
 python main-read-state.py            # passive joint state, nothing moves
+python tools/can_id_scan.py          # read-only: which CAN ids answer on which bus
+python tools/stream_joints.py --host <laptop-ip>   # limp joint state -> live Viser model
 python main-imu-read.py              # IMU bring-up + mount-rotation calibration
 python main-set-zero.py --leg left   # set mechanical zero, one leg at a time
 python main-rl.py                    # the policy
@@ -53,6 +55,16 @@ loading a policy, `--virtual` runs against simulated actuators with no hardware,
 seconds.
 
 For tighter loop timing, launch under `sudo chrt -f 80 .venv/bin/python ...`.
+
+### Live joint visualisation
+
+`tools/stream_joints.py` streams limp joint state (kp = kd = 0, like
+`main-read-state.py`) over UDP port 9870. On the laptop, in `diogenes_mjlab`, run
+`python src/diogenes_mjlab/tools/live_joint_viewer.py` and open
+http://localhost:8080. The suspended MJCF model follows the robot in the SIM
+frame, so moving a joint by hand checks bus, id, name and direction sign in one
+go. A link turns yellow while its joint moves and red when its joint is outside
+the MJCF range.
 
 ## Off-hardware testing
 
@@ -93,6 +105,8 @@ utils/
 tools/
   fake_motors.py     simulated RS03 bus
   loopback_check.py  end-to-end smoke test
+  can_id_scan.py     read-only CAN id discovery per bus
+  stream_joints.py   limp joint state -> live Viser viewer
 legacy/              pre-dual-bus scripts, kept for reference (see its README)
 ```
 
@@ -104,18 +118,45 @@ observation and action ordering. It is cross-checked at import against
 CAN id is never used as a joint identity above the transport layer — with two
 buses it is not unique enough to be one.
 
+### The sim joint contract
+
+`sim_joint_contract.json` is exported from the MJCF by
+`diogenes_mjlab/src/diogenes_mjlab/harold_biped/joint_contract.py`. It gives
+each joint's sim range and, as signs, which way a positive angle moves the foot,
+plus a `direction_signature` hash of those signs.
+
+- Position limits are declared in the sim frame, derived from the contract's
+  ranges plus `SIM_LIMIT_MARGIN`, and converted to the hardware frame through
+  each joint's `direction`. Correcting a sign cannot leave a limit reversed.
+- `direction` signs were verified by hand on 2026-09-24 (the right calf was
+  found reversed and fixed), and `DIRECTIONS_VERIFIED_SIGNATURE` records the
+  contract they were checked against. If the sim's joint conventions change,
+  the re-exported contract has a new signature and `Robot.start` refuses to
+  apply gain until the mapping test is repeated and the signature updated.
+  Limp tools still run, so the test itself stays possible.
+- On the sim side, `tests/test_joint_contract.py` pins the contract, so the
+  change is caught when it happens rather than on the robot.
+
 ### Observation layout
 
 `config.OBSERVATION_TERMS` names the terms in order; `control/observation.py`
 owns their widths. The total is checked against the ONNX model's declared input
 width at startup, before any bus is opened, and a mismatch is fatal.
 
+### Motor-side CAN timeout
+
+Every start-up arms each motor's CAN timeout (`WATCHDOG_MS`) and refuses to
+enable unless it is confirmed. Motors with the `0x7028` register are checked by
+readback. Three of Harold's RS03s (can0 ids 1 and 2, can1 id 3) run firmware
+without it, so they get a zero-force silence test instead: enabled at
+kp = kd = torque = 0, left without traffic for 2 × `WATCHDOG_MS`, and required
+to report themselves disabled. It adds about half a second to start-up. Limp-only
+tools skip the requirement; `main-rl.py --allow-unverified-watchdogs` overrides it.
+
 ## Open items
 
 - `POLICY_JOINT_ORDER` and `OBSERVATION_TERMS` are the expected six-joint + IMU
   layout, not a verified one. Confirm both against the retrained MJLab env.
-- The right leg's `direction` signs and asymmetric joint limits currently copy
-  the left leg's. Confirm each against the real mechanism before applying gain.
 - `IMU.mount_rotation` is the identity placeholder. Measure it with
   `main-imu-read.py`.
 - Loop timing and MCP2515 RX-overrun counters have not been measured on the real

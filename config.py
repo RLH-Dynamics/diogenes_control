@@ -5,6 +5,9 @@ Everything the robot knows about itself lives here as plain data. Modules take a
 config edit rather than a code change.
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from robot.model import BusSpec, ImuSpec, JointSpec, RobotSpec, SafetySpec
@@ -24,37 +27,61 @@ BUSES = [
 HOST_ID = 0xFD
 
 ### ---------------------------------------------------------------- JOINTS ###
+# Each leg's bus uses the same ids: hip = 1, thigh = 2, calf = 3. Identity is
+# (bus, can_id), so the repeat across buses is fine. Verified with
+# tools/can_id_scan.py.
+#
 # ORDER MATTERS. This list defines the observation and action ordering for the
 # policy. See the ordering contract in robot/model.py.
 #
-# `direction` maps hardware frame -> sim frame.
-# `default_pos` is in the SIM frame and must equal the training env's default.
-# `pos_limits` / `vel_limits` are in the HARDWARE frame (what the motor reports).
+# `direction` maps hardware frame -> sim frame. The signs below were verified
+# on the real robot on 2026-09-24 by moving each joint by hand with
+# tools/stream_joints.py + the Viser live joint viewer. The right calf was
+# found reversed and flipped to +1. Note the sim's thigh axes are mirrored
+# left/right while both calves share one convention, so the calves' signs are
+# expected to differ from each other even though the thighs' do not.
 #
-# TODO(bring-up): the right leg currently copies the left leg's direction signs
-# and limits verbatim. If the right leg is mechanically mirrored, some of these
-# signs and the asymmetric thigh/calf limits need flipping. Confirm joint by
-# joint with main-imu-read.py / main-read-state.py before enabling torque.
+# That check only holds for the sim joint meanings it was made against, so
+# DIRECTIONS_VERIFIED_SIGNATURE records the contract's direction_signature at
+# the time. If the sim's joint conventions change, the exported contract gets
+# a new signature and Robot.start refuses to apply gain until the mapping test
+# is repeated and this value updated. Limp tools still run, so you can.
+DIRECTIONS_VERIFIED_SIGNATURE = "51cd6f1d87d8b245"
+
+# `default_pos` is in the SIM frame and must equal the training env's default.
+# Position limits are the sim joint ranges (from the contract) widened by
+# SIM_LIMIT_MARGIN, since a real joint can overshoot where the sim constraint
+# would not. They are converted to the hardware frame through `direction`.
+SIM_CONTRACT = json.loads(
+    (Path(__file__).parent / "sim_joint_contract.json").read_text())
+SIM_LIMIT_MARGIN = 0.05        # rad, ~3 deg
+
+
+def sim_limits(name: str) -> tuple[float, float]:
+    lo, hi = SIM_CONTRACT["joints"][name]["range"]
+    return (lo - SIM_LIMIT_MARGIN, hi + SIM_LIMIT_MARGIN)
+
+
 JOINTS = [
     JointSpec(name="left_hip",    leg="left",  bus="can0", can_id=1,
               direction= 1.0, default_pos=0.0,
-              pos_limits=(-0.785, 0.785), vel_limits=(-20.94, 20.94)),
+              sim_pos_limits=sim_limits("left_hip"),    vel_limits=(-20.94, 20.94)),
     JointSpec(name="left_thigh",  leg="left",  bus="can0", can_id=2,
               direction= 1.0, default_pos=0.0,
-              pos_limits=(-1.57, 0.261),  vel_limits=(-20.94, 20.94)),
+              sim_pos_limits=sim_limits("left_thigh"),  vel_limits=(-20.94, 20.94)),
     JointSpec(name="left_calf",   leg="left",  bus="can0", can_id=3,
               direction=-1.0, default_pos=0.0,
-              pos_limits=(-1.57, 0.018),  vel_limits=(-20.94, 20.94)),
+              sim_pos_limits=sim_limits("left_calf"),   vel_limits=(-20.94, 20.94)),
 
-    JointSpec(name="right_hip",   leg="right", bus="can1", can_id=4,
+    JointSpec(name="right_hip",   leg="right", bus="can1", can_id=1,
               direction= 1.0, default_pos=0.0,
-              pos_limits=(-0.785, 0.785), vel_limits=(-20.94, 20.94)),
-    JointSpec(name="right_thigh", leg="right", bus="can1", can_id=5,
+              sim_pos_limits=sim_limits("right_hip"),   vel_limits=(-20.94, 20.94)),
+    JointSpec(name="right_thigh", leg="right", bus="can1", can_id=2,
               direction= 1.0, default_pos=0.0,
-              pos_limits=(-1.57, 0.261),  vel_limits=(-20.94, 20.94)),
-    JointSpec(name="right_calf",  leg="right", bus="can1", can_id=6,
-              direction=-1.0, default_pos=0.0,
-              pos_limits=(-1.57, 0.018),  vel_limits=(-20.94, 20.94)),
+              sim_pos_limits=sim_limits("right_thigh"), vel_limits=(-20.94, 20.94)),
+    JointSpec(name="right_calf",  leg="right", bus="can1", can_id=3,
+              direction= 1.0, default_pos=0.0,
+              sim_pos_limits=sim_limits("right_calf"),  vel_limits=(-20.94, 20.94)),
 ]
 
 # Copied verbatim from the training environment's joint ordering. RobotSpec
@@ -144,6 +171,9 @@ SPEC = RobotSpec(
     imu=IMU,
     safety=SAFETY,
     watchdog_ms=WATCHDOG_MS,
+    sim_contract=SIM_CONTRACT,
+    directions_verified_signature=DIRECTIONS_VERIFIED_SIGNATURE,
+    sim_limit_margin=SIM_LIMIT_MARGIN,
 )
 
 NUM_JOINTS = SPEC.num_joints

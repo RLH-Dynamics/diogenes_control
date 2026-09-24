@@ -26,7 +26,9 @@ from control.policy import HoldPolicy
 from robot.robot import Robot
 from sensors.base import NullImu
 from tools.fake_motors import FakeRobot
-from utils.exceptions import SafetyLimitError
+from utils.exceptions import (
+    DirectionsUnverifiedError, SafetyLimitError, WatchdogUnverifiedError,
+)
 from utils.realtime import LoopPacer
 from utils.recorder import Recorder
 from utils.safety import SafetyMonitor
@@ -44,6 +46,87 @@ def virtual_spec():
     """config.SPEC, rebound to the in-process virtual CAN backend."""
     buses = [dataclasses.replace(b, interface="virtual") for b in config.SPEC.buses]
     return dataclasses.replace(config.SPEC, buses=buses)
+
+
+# Harold's three RS03s whose firmware lacks the CAN-timeout register.
+LEGACY_MOTORS = {("can0", 1), ("can0", 2), ("can1", 3)}
+
+
+def watchdog_checks(spec):
+    """Robot.start's watchdog gate, against fresh fake buses per scenario."""
+    print("\n--- Watchdog gate ---")
+    scenarios = [
+        ("all motors have the register", (), None, True),
+        ("legacy motors that do time out", LEGACY_MOTORS, 0.1, True),
+        ("legacy motors that never time out", LEGACY_MOTORS, None, False),
+    ]
+    for label, legacy, timeout_s, should_start in scenarios:
+        sim = FakeRobot(spec, legacy_motors=legacy, legacy_timeout_s=timeout_s)
+        sim.start()
+        robot = Robot(spec, imu=NullImu())
+        enabled_at_refusal = None
+        try:
+            robot.start(control_mode='MIT', require_watchdogs=True)
+            started = True
+        except WatchdogUnverifiedError:
+            started = False
+            enabled_at_refusal = [
+                (b.channel, m.can_id) for b in sim.buses
+                for m in b.motors.values() if m.enabled
+            ]
+        finally:
+            robot.shutdown()
+            sim.stop()
+        outcome = "started" if started else "refused"
+        check(f"{label}: {outcome}", started == should_start)
+        if not started:
+            check(f"{label}: nothing left enabled on refusal",
+                  enabled_at_refusal == [], f"enabled: {enabled_at_refusal}")
+
+
+def contract_checks(spec):
+    """The sim joint contract gate and the limits derived from it."""
+    print("\n--- Sim joint contract ---")
+    check("config directions verified against the shipped contract",
+          spec.directions_verified,
+          f"signature {spec.sim_contract['direction_signature']}")
+
+    # A changed sim convention must stop Robot.start before any CAN traffic.
+    changed = dict(spec.sim_contract, direction_signature="0" * 16)
+    stale = dataclasses.replace(spec, sim_contract=changed)
+    sim = FakeRobot(stale)
+    sim.start()
+    robot = Robot(stale, imu=NullImu())
+    try:
+        robot.start(control_mode='MIT')
+        refused = False
+    except DirectionsUnverifiedError:
+        refused = True
+    finally:
+        robot.shutdown()
+        sim.stop()
+    check("changed sim convention refused", refused)
+    check("refused before any CAN traffic", sim.frames_seen == 0,
+          f"{sim.frames_seen} frames")
+
+    # Limits must stay inside the sim range plus the margin.
+    j = spec.joints[0]
+    lo, hi = spec.sim_contract['joints'][j.name]['range']
+    too_wide = dataclasses.replace(j, sim_pos_limits=(lo, hi + spec.sim_limit_margin + 0.1))
+    try:
+        dataclasses.replace(spec, joints=[too_wide, *spec.joints[1:]])
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("limits beyond the sim range rejected", rejected)
+
+    for jt in spec.joints:
+        hw = tuple(sorted(v * jt.direction for v in jt.sim_pos_limits))
+        if hw != jt.pos_limits:
+            check(f"{jt.name} hardware limits follow direction", False, f"{jt.pos_limits}")
+            break
+    else:
+        check("hardware limits follow each joint's direction", True)
 
 
 def main():
@@ -177,6 +260,9 @@ def main():
     finally:
         robot.shutdown()
         sim.stop()
+
+    watchdog_checks(spec)
+    contract_checks(spec)
 
     print(f"\n{sum(results)}/{len(results)} checks passed.")
     sys.exit(0 if all(results) else 1)

@@ -28,7 +28,8 @@ def main():
     period = 1.0 / args.rate
 
     try:
-        with RobotSession(SPEC, use_imu=not args.no_imu, realtime=False) as robot:
+        with RobotSession(SPEC, use_imu=not args.no_imu, realtime=False,
+                          limp_only=True) as robot:
             print("[INFO] Motors enabled and limp. Reading state...")
             time.sleep(0.5)
 
