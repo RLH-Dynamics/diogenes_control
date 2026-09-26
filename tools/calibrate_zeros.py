@@ -10,7 +10,7 @@ you can reproduce by hand, one joint at a time:
   3. CALVES  first place the thighs where it is comfortable and press Enter to
              lock them; then push each calf to its stop and hold it, press Enter.
 
-Where those references sit in the sim frame (0, 102.9 and 75 deg) lives in
+Where those references sit in the sim frame (0, 100.9 and 75 deg) lives in
 config.py as each joint's `sim_offset`, with its sign in ZERO_OFFSET_SIGN; check
 them in the live viewer afterwards (tools/stream_joints.py).
 

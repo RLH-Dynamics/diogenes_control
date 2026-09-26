@@ -36,8 +36,9 @@ WALKING
 A walking policy (its profile takes a velocity command) needs a command source:
 --teleop (tools/gamepad_teleop.py on the laptop) or --command VX,WZ for a fixed
 command. With --teleop the loop holds the crouch after the soft start until
-START is pressed: lower the robot on its rope until the feet carry it, then
-press START. B (STOP) ends the run at any time; the motors then go limp.
+START (OPTIONS on the pad) is pressed: lower the robot on its rope until the
+feet carry it, then press it. STOP (CIRCLE) ends the run at any time; the
+motors then go limp.
 
     python main-rl.py --model policy_walk.onnx --teleop   # on the Pi
     python3 tools/gamepad_teleop.py                       # on the laptop
@@ -223,7 +224,7 @@ def main():
                     if soft_start.done(elapsed) and not announced_wait:
                         announced_wait = True
                         print("[INFO] Holding the start pose. Lower the robot until "
-                              "its feet carry it, then press START (B stops).")
+                              "its feet carry it, then press OPTIONS (CIRCLE stops).")
                 else:
                     if not policy_running:
                         # Fresh clock and observation history, as at an episode start.

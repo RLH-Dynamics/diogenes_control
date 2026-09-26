@@ -56,6 +56,84 @@ def parse_script(text):
     return segs
 
 
+class WalkSim:
+    """The walking robot in MuJoCo, read and driven like the real one: joint
+    state in policy order, a BNO085 sample in the base frame (through the mount
+    rotation, as the real reader gives it), and RS03 PD targets per 20 ms."""
+
+    def __init__(self, model_path: Path):
+        self.info = json.loads(model_path.with_suffix(".json").read_text())
+        self.model = mujoco.MjModel.from_binary_path(str(model_path))
+        self.data = mujoco.MjData(self.model)
+        m, info = self.model, self.info
+        names = SPEC.names
+        assert names == info["joint_names"], (names, info["joint_names"])
+        self.qadr = np.array([m.jnt_qposadr[m.joint(n).id] for n in names])
+        self.dadr = np.array([m.jnt_dofadr[m.joint(n).id] for n in names])
+        self.act = np.array([m.actuator(n).id for n in names])
+        self.site = m.site(info["imu_site"]).id
+        self.mount = np.asarray(SPEC.imu.mount_rotation, dtype=np.float64)  # base <- chip
+        self.substeps = int(round(SPEC.dt / m.opt.timestep))
+        self.crouch = np.array([info["crouch"][n] for n in names])
+        self.peak_tau = np.zeros(len(names))
+        self.reset()
+
+    def reset(self):
+        mujoco.mj_resetDataKeyframe(self.model, self.data, self.model.key(self.info["keyframe"]).id)
+        mujoco.mj_forward(self.model, self.data)
+        self.home = self.data.qpos[:7].copy()
+
+    def joints(self):
+        return self.data.qpos[self.qadr].copy(), self.data.qvel[self.dadr].copy()
+
+    def imu_sample(self) -> ImuSample:
+        d = self.data
+        r_site = d.site_xmat[self.site].reshape(3, 3)           # world <- chip
+        g_chip = r_site.T @ np.array([0.0, 0.0, -1.0])
+        vel = np.zeros(6)
+        mujoco.mj_objectVelocity(self.model, d, mujoco.mjtObj.mjOBJ_SITE, self.site, vel, 1)
+        return ImuSample(t=d.time, quat=d.qpos[3:7].copy(), ang_vel=self.mount @ vel[:3],
+                         lin_accel=np.zeros(3), projected_gravity=self.mount @ g_chip)
+
+    def _torque(self, target):
+        info, d = self.info, self.data
+        q, qd = d.qpos[self.qadr], d.qvel[self.dadr]
+        tau = info["kp"] * (target - q) - info["kd"] * qd
+        sat, w0, peak = info["saturation_torque"], info["no_load_speed"], info["peak_torque"]
+        hi = np.minimum(peak, sat * (1.0 - qd / w0))
+        lo = np.maximum(-peak, sat * (-1.0 - qd / w0))
+        return np.clip(tau, lo, hi)
+
+    def step(self, target=None, hold_base=False):
+        """One 20 ms control period. target=None leaves the motors limp;
+        hold_base pins the torso where it started (the rope)."""
+        for _ in range(self.substeps):
+            if target is None:
+                self.data.ctrl[self.act] = 0.0
+            else:
+                tau = self._torque(target)
+                self.peak_tau = np.maximum(self.peak_tau, np.abs(tau))
+                self.data.ctrl[self.act] = tau
+            if hold_base:
+                self.data.qpos[:7] = self.home
+                self.data.qvel[:6] = 0.0
+            mujoco.mj_step(self.model, self.data)
+
+    def base_state(self):
+        """(forward speed in the heading frame m/s, yaw rate rad/s, tilt rad, height m)."""
+        d = self.data
+        w, x, y, z = d.qpos[3:7]
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        v = d.qvel[0:3]
+        v_fwd = np.cos(yaw) * v[0] + np.sin(yaw) * v[1]
+        tilt = np.arccos(np.clip(1 - 2 * (x * x + y * y), -1, 1))
+        return v_fwd, d.qvel[5], tilt, d.qpos[2]
+
+    def fallen(self):
+        _, _, tilt, height = self.base_state()
+        return tilt > FALL_TILT or height < FALL_HEIGHT
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("policy", type=Path)
@@ -66,74 +144,32 @@ def main():
                    help="Save the trajectory (time, qpos, command) as .npz")
     args = p.parse_args()
 
-    info = json.loads(args.model.with_suffix(".json").read_text())
-    model = mujoco.MjModel.from_binary_path(str(args.model))
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, model.key(info["keyframe"]).id)
-    mujoco.mj_forward(model, data)
-
-    names = SPEC.names
-    assert names == info["joint_names"], (names, info["joint_names"])
-    qadr = np.array([model.jnt_qposadr[model.joint(n).id] for n in names])
-    dadr = np.array([model.jnt_dofadr[model.joint(n).id] for n in names])
-    act = np.array([model.actuator(n).id for n in names])
-    site = model.site(info["imu_site"]).id
-    mount = np.asarray(SPEC.imu.mount_rotation, dtype=np.float64)  # base <- chip
-    kp, kd = info["kp"], info["kd"]
-    peak, sat, w0 = info["peak_torque"], info["saturation_torque"], info["no_load_speed"]
-    substeps = int(round(SPEC.dt / model.opt.timestep))
-
-    policy = Policy(SPEC, str(args.policy), POLICY_PROFILES, clock=lambda: data.time)
+    sim = WalkSim(args.model)
+    policy = Policy(SPEC, str(args.policy), POLICY_PROFILES, clock=lambda: sim.data.time)
     if not policy.profile.uses_command:
         sys.exit(f"{policy.profile.task_id} is not a walking policy.")
-
-    def imu_sample():
-        r_site = data.site_xmat[site].reshape(3, 3)          # world <- chip
-        g_chip = r_site.T @ np.array([0.0, 0.0, -1.0])
-        vel = np.zeros(6)
-        mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_SITE, site, vel, 1)
-        return ImuSample(t=data.time, quat=data.qpos[3:7].copy(), ang_vel=mount @ vel[:3],
-                         lin_accel=np.zeros(3), projected_gravity=mount @ g_chip)
-
-    def torque(target):
-        q, qd = data.qpos[qadr], data.qvel[dadr]
-        tau = kp * (target - q) - kd * qd
-        hi = np.minimum(peak, sat * (1.0 - qd / w0))
-        lo = np.maximum(-peak, sat * (-1.0 - qd / w0))
-        return np.clip(tau, lo, hi)
 
     policy.reset()
     log_t, log_q, log_cmd = [], [], []
     fell = None
     results = []
-    peak_tau = np.zeros(len(names))
     for dur, vx, wz in args.script:
         policy.set_command(vx, 0.0, wz)
-        seg_start = data.time
+        seg_start = sim.data.time
         vel_sum, yaw_sum, n = 0.0, 0.0, 0
-        while data.time < seg_start + dur - 1e-9:
-            target = policy.act(data.qpos[qadr].copy(), data.qvel[dadr].copy(), imu_sample())
-            for _ in range(substeps):
-                tau = torque(target)
-                peak_tau = np.maximum(peak_tau, np.abs(tau))
-                data.ctrl[act] = tau
-                mujoco.mj_step(model, data)
-            # Base state in the heading frame.
-            w, x, y, z = data.qpos[3:7]
-            yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-            v = data.qvel[0:3]
-            v_fwd = np.cos(yaw) * v[0] + np.sin(yaw) * v[1]
-            up_z = 1 - 2 * (x * x + y * y)                  # world z of the base z axis
-            tilt = np.arccos(np.clip(up_z, -1, 1))
-            log_t.append(data.time)
-            log_q.append(data.qpos.copy())
+        while sim.data.time < seg_start + dur - 1e-9:
+            target = policy.act(*sim.joints(), sim.imu_sample())
+            sim.step(target)
+            v_fwd, yaw_rate, tilt, height = sim.base_state()
+            log_t.append(sim.data.time)
+            log_q.append(sim.data.qpos.copy())
             log_cmd.append((vx, wz))
-            if data.time - seg_start > 1.0:
+            if sim.data.time - seg_start > 1.0:
                 vel_sum += v_fwd
-                yaw_sum += data.qvel[5]
+                yaw_sum += yaw_rate
                 n += 1
-            if tilt > FALL_TILT or data.qpos[2] < FALL_HEIGHT:
-                fell = (data.time, np.degrees(tilt), data.qpos[2])
+            if sim.fallen():
+                fell = (sim.data.time, np.degrees(tilt), height)
                 break
         results.append((dur, vx, wz, vel_sum / max(n, 1), yaw_sum / max(n, 1)))
         if fell:
@@ -142,14 +178,14 @@ def main():
     print(f"\n{'segment':>22} {'achieved vx':>12} {'achieved wz':>12}")
     for dur, vx, wz, got_vx, got_wz in results:
         print(f"  {dur:4.1f} s vx {vx:+.2f} wz {wz:+.2f}  {got_vx:+11.3f}  {got_wz:+11.3f}")
-    print(f"peak |torque| per joint (N.m): {np.round(peak_tau, 1).tolist()}")
+    print(f"peak |torque| per joint (N.m): {np.round(sim.peak_tau, 1).tolist()}")
     if fell:
         print(f"[FAIL] fell at t={fell[0]:.2f} s (tilt {fell[1]:.0f} deg, height {fell[2]:.3f} m)")
     else:
-        print(f"[OK] walked the whole script ({data.time:.1f} s) without falling")
+        print(f"[OK] walked the whole script ({sim.data.time:.1f} s) without falling")
     if args.save:
         np.savez(args.save, t=np.array(log_t), qpos=np.array(log_q), command=np.array(log_cmd),
-                 joint_names=np.array(names))
+                 joint_names=np.array(SPEC.names))
         print(f"[OK] trajectory saved to {args.save}")
     sys.exit(1 if fell else 0)
 

@@ -61,7 +61,7 @@ class Bno085Reader:
     def __init__(self, spec, i2c_frequency: int = 50_000):
         self.spec = spec
         self.i2c_frequency = i2c_frequency
-        self.mount = spec.mount_matrix
+        self.mount = spec.base_from_chip  # nominal axes + the measured pitch trim
 
         self._sensor = None
         self._i2c = None

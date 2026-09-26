@@ -148,9 +148,26 @@ class ImuSpec:
     # converged to the real tilt ~0.4 s later on the robot (2026-09-25).
     settle_s: float = 0.6
 
+    # Degrees the IMU reads nose-DOWN while the torso is level: the small tilt
+    # between the chip and the torso that mount_rotation's right angles don't
+    # capture. Measured against an inclinometer on the torso; taken off every
+    # reading (gravity, gyro, tilt check, policy input).
+    pitch_offset_deg: float = 0.0
+
     @property
     def mount_matrix(self) -> np.ndarray:
+        """The chip's nominal axes in the base frame (base <- chip), as in the
+        sim model. The walking policy's chip-frame terms use this."""
         return np.array(self.mount_rotation, dtype=np.float64)
+
+    @property
+    def base_from_chip(self) -> np.ndarray:
+        """mount_matrix with the pitch trim: what the reader applies, so its
+        base-frame readings are those of a perfectly mounted chip."""
+        a = np.radians(self.pitch_offset_deg)
+        c, s = np.cos(a), np.sin(a)
+        trim = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])  # pitch reads a less nose-down
+        return trim @ self.mount_matrix
 
 
 @dataclass(frozen=True)

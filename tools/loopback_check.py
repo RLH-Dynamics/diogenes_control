@@ -255,12 +255,32 @@ def policy_checks(spec):
         check(f"{label} refused", refused({**walk_meta, **change}, w_width))
 
 
+def imu_trim_checks(spec):
+    """The pitch trim takes pitch_offset_deg off the reading, gravity and gyro
+    alike, and the policy still sees the chip's nominal axes."""
+    print("\n--- IMU pitch trim ---")
+    imu = dataclasses.replace(spec.imu, pitch_offset_deg=2.0)
+    level_chip = np.array([0.0, -1.0, 0.0])        # chip reads level (+y up)
+    g = imu.base_from_chip @ level_chip
+    pitch = np.degrees(np.arcsin(g[0]))
+    check("a chip reading level shows the torso 2 deg nose-up", abs(pitch + 2.0) < 1e-6,
+          f"pitch {pitch:+.3f} deg")
+    # The chip sits tipped 2 deg nose-down on the torso, so its up axis (+y)
+    # leans 2 deg forward (+x) in the base frame; gyro readings turn with it.
+    chip_up = imu.base_from_chip @ np.array([0.0, 1.0, 0.0])
+    check("gyro rotated with it", abs(np.degrees(np.arcsin(chip_up[0])) - 2.0) < 1e-6,
+          f"chip up axis in base frame {np.round(chip_up, 4).tolist()}")
+    check("zero offset leaves the mount unchanged",
+          np.allclose(dataclasses.replace(spec.imu, pitch_offset_deg=0.0).base_from_chip,
+                      spec.imu.mount_matrix))
+
+
 def teleop_checks():
-    """The UDP command link: deadman, link timeout, START/STOP, sender lock."""
+    """The UDP command link: commands, link timeout, START/STOP, stale packets."""
     print("\n--- Teleop link ---")
     import socket
     from control.command_source import (
-        BUTTON_DEADMAN, BUTTON_START, BUTTON_STOP, UdpCommandSource, encode,
+        BUTTON_START, BUTTON_STOP, UdpCommandSource, encode,
     )
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     probe.bind(("127.0.0.1", 0))
@@ -276,12 +296,10 @@ def teleop_checks():
 
     try:
         check("no packets: step in place", src.command() == (0.0, 0.0, 0.0))
-        send(1, 0.2, 0.3, 0)
-        check("deadman released: step in place", src.command() == (0.0, 0.0, 0.0))
-        send(2, 0.2, 0.3, BUTTON_DEADMAN)
+        send(2, 0.2, 0.3, 0)
         vx, _, wz = src.command()
-        check("deadman held: command passes", abs(vx - 0.2) < 1e-6 and abs(wz - 0.3) < 1e-6)
-        send(1, 0.9, 0.9, BUTTON_DEADMAN)
+        check("command passes, no button needed", abs(vx - 0.2) < 1e-6 and abs(wz - 0.3) < 1e-6)
+        send(1, 0.9, 0.9, 0)
         check("stale packet ignored", abs(src.command()[0] - 0.2) < 1e-6)
         time.sleep(0.25)
         check("link lost: step in place", src.command() == (0.0, 0.0, 0.0))
@@ -662,6 +680,7 @@ def main():
     watchdog_checks(spec)
     contract_checks(spec)
     policy_checks(spec)
+    imu_trim_checks(spec)
     teleop_checks()
     turn_checks(spec)
     offset_checks(spec)

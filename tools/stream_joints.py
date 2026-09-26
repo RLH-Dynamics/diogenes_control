@@ -75,7 +75,7 @@ def main():
         simulator.start()
     try:
         use_imu = args.imu and simulator is None
-        mount = spec.imu.mount_matrix if use_imu else None
+        mount = spec.imu.base_from_chip if use_imu else None  # incl. the pitch trim
         with RobotSession(spec, use_imu=use_imu, realtime=False,
                           limp_only=True) as robot:
             print(f"[INFO] Motors enabled and limp. Streaming to {dest[0]}:{dest[1]} "

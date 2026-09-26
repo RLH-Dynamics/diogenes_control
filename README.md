@@ -72,15 +72,17 @@ read from the file.
 trained 2026-09-26). On the laptop, with the gamepad plugged in:
 
 ```bash
-python3 tools/gamepad_teleop.py --probe       # once: check the stick/button numbers
+python3 tools/gamepad_teleop.py --probe       # a new pad: find its button/stick numbers
 python3 tools/gamepad_teleop.py --pi <pi-ip>  # then drive
 ```
 
 On the Pi, `main-rl.py --model policy_walk.onnx --teleop` soft-starts into the
 crouch and holds it. Lower the robot on its rope until the feet carry it, then
-press START. Hold LB (deadman) and use the left stick for speed (-0.1..0.3 m/s)
-and the right stick to turn (+-0.5 rad/s); released, or with the link lost for
-0.5 s, it steps in place. B stops the run and the motors go limp.
+press OPTIONS (START). The left stick sets speed (-0.1..0.3 m/s) and the right
+stick turns (+-0.5 rad/s); with the sticks centred, or the link lost for 0.5 s,
+it steps in place. CIRCLE stops the run and the motors go
+limp. (Buttons as on Harold's PlayStation-layout pad; see the tool's flags for
+another.)
 
 `tools/sim2sim_walk.py` runs a walking policy through this stack's policy code
 against the training robot in MuJoCo (model from diogenes_mjlab
@@ -92,7 +94,8 @@ For tighter loop timing, launch under `sudo chrt -f 80 .venv/bin/python ...`.
 
 `tools/calibrate_zeros.py` sets each motor's zero at a physical reference, one
 joint at a time: hips against a straight edge (sim zero), then thighs pushed
-against the body (102.9 deg from sim zero) while the hips are held firm, then
+against the body (100.9 deg from sim zero; the CAD's 102.9 made the walking
+policy drift backward) while the hips are held firm, then
 calves pushed to their stop (75 deg) while the thighs are held. `sim_offset` in
 `config.py` places each reference in the sim frame; the offset signs are
 confirmed afterwards in the live viewer and recorded by setting

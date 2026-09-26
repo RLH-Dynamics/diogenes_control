@@ -5,20 +5,22 @@ joystick device (/dev/input/js0) and sends velocity commands to the Pi over UDP
 at 50 Hz (control/command_source.py has the packet and the Pi-side safety
 behaviour).
 
-Controls (Xbox-style layout; check yours with --probe and remap with flags):
+Controls. The defaults match Harold's Bluetooth pad, a PlayStation-layout
+"Wireless Controller" (checked with --probe 2026-09-26); remap with the flags
+for another pad:
 
-  LB (hold)       deadman: commands only count while it is held; released,
-                  the robot steps in place
-  left stick Y    forward / backward speed
-  right stick X   turn left / right
-  START           start the policy (after the soft start, with the feet down)
-  B               stop: ends the run, the motors go limp
+  left stick Y    forward / backward speed                         axis 1
+  right stick X   turn left / right                                axis 3
+  OPTIONS         start the policy (after the soft start, with the
+                  feet down)                                       button 9
+  CIRCLE          stop: ends the run, the motors go limp           button 1
 
     python3 tools/gamepad_teleop.py --pi 192.168.0.11
-    python3 tools/gamepad_teleop.py --probe      # print raw axes and buttons
+    python3 tools/gamepad_teleop.py --probe      # find a pad's button and stick numbers
 
-Speeds are capped to what the walking policy was trained for, and the command
-is rate-limited so the stick can't ask for an instant jump.
+Sticks centred (they spring back), the robot steps in place. Speeds are capped
+to what the walking policy was trained for, and the command is rate-limited so
+the stick can't ask for an instant jump.
 """
 
 import argparse
@@ -31,7 +33,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from control.command_source import (  # noqa: E402
-    BUTTON_DEADMAN, BUTTON_START, BUTTON_STOP, DEFAULT_PORT, encode,
+    BUTTON_START, BUTTON_STOP, DEFAULT_PORT, encode,
 )
 
 JS_EVENT = struct.Struct("<IhBB")  # time ms, value, type, number
@@ -45,17 +47,19 @@ def parse_args():
     p.add_argument("--pi", default="192.168.0.11", help="Pi address (default: %(default)s)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--device", default="/dev/input/js0")
-    p.add_argument("--probe", action="store_true", help="Print raw axes/buttons and exit on Ctrl+C.")
+    p.add_argument("--probe", action="store_true",
+                   help="Print each button press and stick move, to find their numbers.")
     p.add_argument("--max-forward", type=float, default=0.3, help="m/s (default: %(default)s)")
     p.add_argument("--max-backward", type=float, default=0.1, help="m/s (default: %(default)s)")
-    p.add_argument("--max-turn", type=float, default=0.5, help="rad/s (default: %(default)s)")
+    # Turning capped below the policy's 0.5 rad/s and ramped gently: the v3
+    # policy fell after a full-stick turn on foam (2026-09-26, run 5).
+    p.add_argument("--max-turn", type=float, default=0.3, help="rad/s (default: %(default)s)")
     p.add_argument("--accel", type=float, default=0.5, help="m/s^2 speed slew limit")
-    p.add_argument("--turn-accel", type=float, default=2.0, help="rad/s^2 turn slew limit")
+    p.add_argument("--turn-accel", type=float, default=1.0, help="rad/s^2 turn slew limit")
     p.add_argument("--axis-forward", type=int, default=1, help="left stick Y")
     p.add_argument("--axis-turn", type=int, default=3, help="right stick X")
-    p.add_argument("--button-deadman", type=int, default=4, help="LB")
-    p.add_argument("--button-start", type=int, default=7, help="START")
-    p.add_argument("--button-stop", type=int, default=1, help="B")
+    p.add_argument("--button-start", type=int, default=9, help="OPTIONS")
+    p.add_argument("--button-stop", type=int, default=1, help="CIRCLE")
     return p.parse_args()
 
 
@@ -93,23 +97,33 @@ def main():
                     buttons[number] = value
 
     if args.probe:
-        print("Move each stick and press each button; Ctrl+C to quit.")
+        print("Press each button and push each stick all the way; one line per event. "
+              "Ctrl+C to quit.")
+        read_events()  # the driver's initial state
+        seen_buttons = dict(buttons)
+        axis_side = {k: round(v / AXIS_MAX) for k, v in axes.items()}
         try:
             while True:
                 select.select([fd], [], [], 0.1)
                 read_events()
-                print("\raxes " + " ".join(f"{k}:{v / AXIS_MAX:+.2f}" for k, v in sorted(axes.items()))
-                      + "   buttons " + " ".join(f"{k}" for k, v in sorted(buttons.items()) if v)
-                      + "      ", end="", flush=True)
+                for k, v in sorted(buttons.items()):
+                    if v != seen_buttons.get(k, 0):
+                        print(f"button {k} {'pressed' if v else 'released'}", flush=True)
+                        seen_buttons[k] = v
+                for k, v in sorted(axes.items()):
+                    side = round(v / AXIS_MAX)  # -1, 0 or +1 (past half travel)
+                    if side != axis_side.get(k, 0):
+                        print(f"axis {k} -> {v / AXIS_MAX:+.2f}", flush=True)
+                        axis_side[k] = side
         except KeyboardInterrupt:
             print()
         return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest = (args.pi, args.port)
-    print(f"[INFO] Sending to {dest[0]}:{dest[1]} at 50 Hz. Hold LB to move, "
-          f"START to start the policy, B to stop the run. Ctrl+C quits (the "
-          f"robot then steps in place until you stop it).")
+    print(f"[INFO] Sending to {dest[0]}:{dest[1]} at 50 Hz. Sticks to move, "
+          f"OPTIONS to start the policy, CIRCLE to stop the run. Ctrl+C quits "
+          f"(the robot then steps in place until you stop it).")
     seq, vx, wz = 0, 0.0, 0.0
     period = 0.02
     next_t = time.monotonic()
@@ -124,23 +138,18 @@ def main():
             if now - next_t > 0.5:
                 next_t = now + period  # fell behind (laptop suspended?)
 
-            deadman = bool(buttons.get(args.button_deadman))
             fwd = -stick(axes.get(args.axis_forward, 0))    # stick up is negative
             turn = -stick(axes.get(args.axis_turn, 0))      # stick right is positive
             target_vx = fwd * (args.max_forward if fwd >= 0 else args.max_backward)
             target_wz = turn * args.max_turn
-            if not deadman:
-                target_vx = target_wz = 0.0
             vx = slew(vx, target_vx, args.accel, period)
             wz = slew(wz, target_wz, args.turn_accel, period)
 
-            flags = (BUTTON_DEADMAN if deadman else 0)
-            flags |= BUTTON_START if buttons.get(args.button_start) else 0
+            flags = BUTTON_START if buttons.get(args.button_start) else 0
             flags |= BUTTON_STOP if buttons.get(args.button_stop) else 0
             sock.sendto(encode(seq, vx, 0.0, wz, flags), dest)
             seq += 1
-            print(f"\r{'DEADMAN' if deadman else 'released'}  vx {vx:+.2f} m/s  "
-                  f"wz {wz:+.2f} rad/s"
+            print(f"\rvx {vx:+.2f} m/s  wz {wz:+.2f} rad/s"
                   + ("  START" if flags & BUTTON_START else "")
                   + ("  STOP" if flags & BUTTON_STOP else "") + "      ",
                   end="", flush=True)

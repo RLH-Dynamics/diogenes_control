@@ -371,6 +371,9 @@ class RobstrideBus:
             # Bits 22..23 of the arbitration id (14..15 of extra_data): 0 reset
             # (disabled), 1 calibration, 2 run. See MOTOR_STATE_*.
             'mode': (extra_data >> 14) & 0x3,
+            # Bits 16..21 (8..13 of extra_data): the motor's fault flags, 0 when
+            # healthy. See STATUS_FAULT_BITS.
+            'faults': (extra_data >> 8) & 0x3F,
         }
 
     def drain_into(self, received: dict) -> int:
@@ -426,6 +429,11 @@ class RobstrideBus:
     MOTOR_STATE_RESET = 0      # disabled
     MOTOR_STATE_CALIBRATION = 1
     MOTOR_STATE_RUN = 2        # enabled
+    # Fault flags in a status reply (bit -> meaning), RobStride protocol.
+    STATUS_FAULT_BITS = {
+        0: "under-voltage", 1: "over-current", 2: "over-temperature",
+        3: "magnetic encoder fault", 4: "Hall encoder fault", 5: "not calibrated",
+    }
 
     def enable_and_verify(self, control_mode: str = 'MIT', timeout: float = 0.5):
         """Configure mode, pre-load zero targets, enable, and verify the motors.

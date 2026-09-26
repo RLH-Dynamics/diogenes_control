@@ -6,10 +6,12 @@ button state; the laptop sends them at ~50 Hz.
 
 SAFETY BEHAVIOUR
 ----------------
-  * Motion needs the deadman button held on the gamepad: without it, or with no
-    packet for LINK_TIMEOUT_S (link lost, laptop script stopped), the command is
-    zero -- step in place. A point-foot biped cannot stand still, so zero is the
-    neutral command, not a stop.
+  * With no packet for LINK_TIMEOUT_S (link lost, laptop script stopped) the
+    command is zero -- step in place. A point-foot biped cannot stand still, so
+    zero is the neutral command, not a stop. The sticks spring back to centre,
+    which is also zero. (A deadman button was tried and dropped, 2026-09-26: it
+    made driving awkward without adding protection the link timeout and STOP
+    don't already give.)
   * STOP (a latched button press) asks the control loop to end the run; the
     motors then go limp as on any exit. Keep the hardware kill switch in reach.
   * Only the first sender is accepted, so another machine on the network
@@ -22,7 +24,7 @@ PACKET (little-endian, 21 bytes)
   f   vx  m/s, + forward
   f   vy  m/s, + left
   f   wz  rad/s, + turn left
-  B   buttons: bit 0 deadman held, bit 1 START pressed, bit 2 STOP pressed
+  B   buttons: bit 1 START pressed, bit 2 STOP pressed (bit 0 unused)
 """
 
 import socket
@@ -35,7 +37,6 @@ MAGIC = b"HRLD"
 DEFAULT_PORT = 5566
 LINK_TIMEOUT_S = 0.5
 
-BUTTON_DEADMAN = 1 << 0
 BUTTON_START = 1 << 1
 BUTTON_STOP = 1 << 2
 
@@ -143,13 +144,11 @@ class UdpCommandSource:
                     and time.monotonic() - self._last_rx < self.timeout_s)
 
     def command(self):
-        """(vx, vy, wz); zero unless the link is live and the deadman is held."""
+        """(vx, vy, wz); zero unless the link is live."""
         with self._lock:
             live = (self._last_rx is not None
                     and time.monotonic() - self._last_rx < self.timeout_s)
-            if live and self._buttons & BUTTON_DEADMAN:
-                return self._cmd
-            return (0.0, 0.0, 0.0)
+            return self._cmd if live else (0.0, 0.0, 0.0)
 
     def start_requested(self) -> bool:
         with self._lock:
@@ -159,10 +158,14 @@ class UdpCommandSource:
         with self._lock:
             return self._stop_latched
 
+    def reset_latches(self):
+        """Forget START/STOP presses (the live sim re-arms after a reset)."""
+        with self._lock:
+            self._start_latched = False
+            self._stop_latched = False
+
     def status(self) -> str:
         if not self.link_ok():
             return "teleop: NO LINK (stepping in place)"
-        with self._lock:
-            deadman = "held" if self._buttons & BUTTON_DEADMAN else "released"
         vx, vy, wz = self.command()
-        return f"teleop: deadman {deadman}, vx {vx:+.2f} wz {wz:+.2f}"
+        return f"teleop: vx {vx:+.2f} wz {wz:+.2f}"

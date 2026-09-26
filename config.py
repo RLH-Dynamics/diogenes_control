@@ -61,7 +61,7 @@ SIM_LIMIT_MARGIN = 0.05        # rad, ~3 deg
 # at a physical reference, and `sim_offset` is where that reference sits in the
 # sim frame:
 #   hips   -- aligned with a straight edge, AT sim zero;
-#   thighs -- pushed against the body, 102.9 deg from sim zero;
+#   thighs -- pushed against the body, 100.9 deg from sim zero;
 #   calves -- pushed against their stop, 75 deg from sim zero.
 # The magnitudes are geometry; the SIGNS say which side of sim zero each stop
 # is on. The signs below come from the first calibration (2026-09-24): just
@@ -71,7 +71,14 @@ SIM_LIMIT_MARGIN = 0.05        # rad, ~3 deg
 # calf axes. Confirmed on the robot in the live viewer (tools/stream_joints.py)
 # on 2026-09-24, at rest and moving each joint. The calves' 64.1 deg was the old
 # by-eye zero being ~11 deg off; the 75 deg stop reference is correct.
-ZERO_REFERENCE_DEG = {"hip": 0.0, "thigh": 102.9, "calf": 75.0}
+#
+# Thigh stop 102.9 -> 100.9 deg (2026-09-26): the first walking runs drifted
+# backward at zero command with both thighs held 3-5 deg further round than
+# the policy does in sim. Sim-to-sim reproduces drift and posture only with the
+# thighs reading ~2 deg high (2.5 deg: -0.06 m/s; slope, gyro bias, COM, IMU
+# pitch and damping errors don't), i.e. the real stop sits ~2 deg short of the
+# CAD figure -- as the first calibration's by-eye readings (100.1/100.2) hinted.
+ZERO_REFERENCE_DEG = {"hip": 0.0, "thigh": 100.9, "calf": 75.0}
 ZERO_OFFSET_SIGN = {
     "left_thigh": +1, "left_calf": -1,
     "right_thigh": -1, "right_calf": -1,
@@ -170,6 +177,12 @@ IMU = ImuSpec(
     mount_rotation=((0.0, 0.0, 1.0),     # base x (forward) = chip +z
                     (1.0, 0.0, 0.0),     # base y (left)    = chip +x
                     (0.0, 1.0, 0.0)),    # base z (up)      = chip +y
+    # 2026-09-26, hanging still: the IMU read 4.2 deg nose-down against 3 deg
+    # on a phone inclinometer on the torso. In the first walking run (zero
+    # command) the robot drifted backward seeing +0.55 deg where the policy
+    # steps in place at +2.9; sim-to-sim reproduces that drift with the IMU
+    # reading 1.2-2 deg too nose-down.
+    pitch_offset_deg=1.2,
     max_age_s=0.06,            # three control cycles at 50 Hz
     report_interval_s=0.005,
 )
