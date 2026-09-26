@@ -12,7 +12,12 @@ whole chain: bus -> CAN id -> joint name -> direction sign -> sim joint.
 
     source setup.sh
     python tools/stream_joints.py --host 192.168.0.10
+    python tools/stream_joints.py --host 192.168.0.10 --imu     # + base orientation
     python tools/stream_joints.py --host 127.0.0.1 --virtual   # no hardware
+
+With --imu each packet also carries the base orientation from the BNO085,
+through config.IMU.mount_rotation (base frame: +x forward, +y left, +z up), so
+the viewer can tilt the model to match and show whether the mount is right.
 
 Pair with diogenes_mjlab/src/diogenes_mjlab/tools/live_joint_viewer.py.
 """
@@ -27,8 +32,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np  # noqa: E402
+
 from config import SPEC  # noqa: E402
 from robot.session import RobotSession  # noqa: E402
+from sensors.base import quat_to_rotation_matrix  # noqa: E402
 from utils.exceptions import HardwareError  # noqa: E402
 
 DEFAULT_PORT = 9870
@@ -39,6 +47,8 @@ def parse_args():
     p.add_argument('--host', required=True, help="Laptop IP running the viewer.")
     p.add_argument('--port', type=int, default=DEFAULT_PORT)
     p.add_argument('--rate', type=float, default=50.0, help="Stream rate in Hz.")
+    p.add_argument('--imu', action='store_true',
+                   help="Also stream the IMU's base orientation, gravity and gyro.")
     p.add_argument('--virtual', action='store_true',
                    help="Use tools/fake_motors.py instead of hardware. The fake "
                         "joints drift slowly so the viewer has something to show.")
@@ -64,7 +74,9 @@ def main():
     if simulator is not None:
         simulator.start()
     try:
-        with RobotSession(spec, use_imu=False, realtime=False,
+        use_imu = args.imu and simulator is None
+        mount = spec.imu.mount_matrix if use_imu else None
+        with RobotSession(spec, use_imu=use_imu, realtime=False,
                           limp_only=True) as robot:
             print(f"[INFO] Motors enabled and limp. Streaming to {dest[0]}:{dest[1]} "
                   f"at {args.rate:.0f} Hz. Ctrl-C to stop.")
@@ -93,6 +105,19 @@ def main():
                         'torque': float(r['torque']), 'temp': float(r['temp']),
                     }
                 packet = {'seq': seq, 't': time.time(), 'joints': joints}
+                if use_imu:
+                    s = robot.read_imu()
+                    # sample.quat is the CHIP's orientation in the IMU's world
+                    # frame; v_base = M v_chip, so R_world_base = R_world_chip M^T.
+                    r_wb = quat_to_rotation_matrix(np.asarray(s.quat)) @ mount.T
+                    packet['imu'] = {
+                        'R_world_base': r_wb.ravel().tolist(),
+                        'gravity': [float(v) for v in s.projected_gravity],
+                        'gyro': [float(v) for v in s.ang_vel],
+                        'tilt_deg': float(np.degrees(s.tilt_rad)),
+                        'status': int(s.status),
+                        'age_ms': float(s.age() * 1000.0),
+                    }
                 sock.sendto(json.dumps(packet).encode(), dest)
                 seq += 1
 

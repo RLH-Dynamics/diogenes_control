@@ -360,7 +360,7 @@ class RobstrideBus:
 
     # ------------------------------------------------------------- replies --
 
-    def _decode_status(self, payload: bytes) -> dict:
+    def _decode_status(self, payload: bytes, extra_data: int = 0) -> dict:
         p_int, v_int, t_int, temp_int = struct.unpack('>HHHh', payload)
         lim = self.limits
         return {
@@ -368,6 +368,9 @@ class RobstrideBus:
             'vel': self._scale_u16_to_value(v_int, lim['V_MIN'], lim['V_MAX']),
             'torque': self._scale_u16_to_value(t_int, lim['T_MIN'], lim['T_MAX']),
             'temp': temp_int / 10.0,      # reported as Celsius * 10
+            # Bits 22..23 of the arbitration id (14..15 of extra_data): 0 reset
+            # (disabled), 1 calibration, 2 run. See MOTOR_STATE_*.
+            'mode': (extra_data >> 14) & 0x3,
         }
 
     def drain_into(self, received: dict) -> int:
@@ -403,7 +406,7 @@ class RobstrideBus:
 
             key = (self.channel, motor_id)
             if key not in received:
-                received[key] = self._decode_status(r_data)
+                received[key] = self._decode_status(r_data, extra_data)
                 new_replies += 1
 
     def raise_pending_faults(self):

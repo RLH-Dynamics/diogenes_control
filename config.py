@@ -151,14 +151,25 @@ WATCHDOG_MS = 100
 MAX_CONSECUTIVE_MISSED_REPLIES = 3
 
 ### --------------------------------------------------------------- SENSORS ###
-# Adafruit BNO085 on the Pi's primary I2C bus. `mount_rotation` maps the sensor
-# frame to the robot base frame; the identity below is a placeholder to be
-# replaced with the matrix you measure during bring-up.
+# Adafruit BNO085 on the Pi's primary I2C bus. `mount_rotation` maps the SENSOR
+# frame to the robot BASE frame, v_base = M @ v_sensor. The base frame is the
+# standard one (+x forward, +y left, +z up), which the tilt interlock assumes.
+#
+# The chip is mounted as the MJCF's `bno085` site: chip +x = robot left,
+# +y = up, +z = forward. The rows below are each base axis in chip axes; the
+# matrix is the site's orientation in the walking model's (standard-frame)
+# root body. Checked on the robot 2026-09-25: level reads chip gravity
+# (0, -1, 0) as in the model, and nose-down, side-down and turning all matched
+# the model in the live viewer (stream_joints.py --imu). tools/imu_check.py
+# re-checks it pass/fail.
+#
+# The walking env observes the IMU in the CHIP frame (imu_gyro / imu_up on the
+# site); feed it M.T @ base-frame values.
 IMU = ImuSpec(
     i2c_address=0x4A,
-    mount_rotation=((1.0, 0.0, 0.0),
-                    (0.0, 1.0, 0.0),
-                    (0.0, 0.0, 1.0)),
+    mount_rotation=((0.0, 0.0, 1.0),     # base x (forward) = chip +z
+                    (1.0, 0.0, 0.0),     # base y (left)    = chip +x
+                    (0.0, 1.0, 0.0)),    # base z (up)      = chip +y
     max_age_s=0.06,            # three control cycles at 50 Hz
     report_interval_s=0.005,
 )

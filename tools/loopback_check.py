@@ -28,7 +28,7 @@ from sensors.base import NullImu
 from tools.fake_motors import FakeRobot
 from utils.exceptions import (
     ActuatorFault, DirectionsUnverifiedError, HardwareIOError, MissedReplies,
-    SafetyLimitError, WatchdogUnverifiedError,
+    MotorDisabled, SafetyLimitError, WatchdogUnverifiedError,
 )
 from utils.realtime import LoopPacer
 from utils.recorder import Recorder
@@ -315,6 +315,48 @@ def reply_tolerance_checks(spec):
         sim.stop()
 
 
+class SlowImu(NullImu):
+    """An IMU whose start() blocks, like the real BNO085 coming up over I2C."""
+
+    def start(self):
+        time.sleep(0.3)
+
+
+def enabled_mode_checks(spec):
+    """Motors must still be running when the loop starts, and a motor that
+    drops out must be noticed. Regression for 2026-09-25, when the IMU started
+    after the motors were enabled, their CAN timeout fired during the pause,
+    and the whole run commanded limp motors without anything noticing."""
+    print("\n--- Motors stay enabled ---")
+    everyone = {(j.bus, j.can_id) for j in spec.joints}
+    sim = FakeRobot(spec, legacy_motors=everyone, legacy_timeout_s=0.1)
+    sim.start()
+    robot = Robot(spec, imu=SlowImu())
+    try:
+        robot.start(control_mode='MIT')
+        try:
+            state = robot.read_limp_state(timeout=0.05)
+            running = True
+        except MotorDisabled as e:
+            running, state = False, None
+        check("slow IMU start does not let the motors time out", running,
+              "" if running else str(e)[:80])
+        check("every reply reports run mode",
+              state is not None and all(s['mode'] == 2 for s in state.values()))
+
+        sim.motor("right_thigh").enabled = False
+        try:
+            robot.read_limp_state(timeout=0.05)
+            caught = ""
+        except MotorDisabled as e:
+            caught = str(e)
+        check("a motor that drops out is caught", "right_thigh" in caught,
+              caught[:60])
+    finally:
+        robot.shutdown()
+        sim.stop()
+
+
 def soft_start_checks(spec):
     """The ramp from the resting pose to the start pose."""
     print("\n--- Soft start ---")
@@ -527,6 +569,7 @@ def main():
     offset_checks(spec)
     soft_start_checks(spec)
     reply_tolerance_checks(spec)
+    enabled_mode_checks(spec)
     calibration_checks()
 
     print(f"\n{sum(results)}/{len(results)} checks passed.")

@@ -121,6 +121,11 @@ class ImuSpec:
     # Target report interval requested from the BNO085, in seconds.
     report_interval_s: float = 0.005
 
+    # How long the reader waits after the first sample before reporting ready.
+    # The BNO085's fusion reports an idealised level orientation at first and
+    # converged to the real tilt ~0.4 s later on the robot (2026-09-25).
+    settle_s: float = 0.6
+
     @property
     def mount_matrix(self) -> np.ndarray:
         return np.array(self.mount_rotation, dtype=np.float64)

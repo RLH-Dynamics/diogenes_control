@@ -22,7 +22,7 @@ import time
 
 from robstride.bus import RobstrideBus
 from robstride.protocol import ParameterType
-from utils.exceptions import HardwareIOError, MissedReplies
+from utils.exceptions import HardwareIOError, MissedReplies, MotorDisabled
 
 
 class RobstrideNetwork:
@@ -50,6 +50,10 @@ class RobstrideNetwork:
         # reading has it subtracted and every command has it added, so the
         # motor and the host agree on where the joint is. See resolve_turns.
         self.turn_offsets = {j.name: 0.0 for j in spec.joints}
+
+        # True between enable() and shutdown(). While set, every status reply
+        # must report run mode; see gather().
+        self.enabled = False
 
         # Rolling diagnostics, read by the recorder and the bring-up scripts.
         self.last_exchange_s = 0.0
@@ -120,12 +124,14 @@ class RobstrideNetwork:
     def enable(self, control_mode: str = 'MIT'):
         for bus in self.buses.values():
             bus.enable_and_verify(control_mode=control_mode)
+        self.enabled = True
 
     def flush(self):
         for bus in self.buses.values():
             bus.flush()
 
     def shutdown(self):
+        self.enabled = False
         for bus in self.buses.values():
             bus.shutdown()
 
@@ -193,7 +199,17 @@ class RobstrideNetwork:
                 if len(received) < expected:
                     time.sleep(0.0002)
 
-        return self._by_name(received)
+        state = self._by_name(received)
+        if self.enabled:
+            dropped = [n for n, s in state.items()
+                       if s['mode'] != RobstrideBus.MOTOR_STATE_RUN]
+            if dropped:
+                raise MotorDisabled(
+                    f"{dropped} report themselves disabled while they should be "
+                    f"running: most likely their CAN timeout fired (a pause of "
+                    f">{self.spec.watchdog_ms} ms in host traffic). They are "
+                    f"limp and will not re-enable on their own.")
+        return state
 
     def _by_name(self, received: dict) -> dict:
         """(channel, can_id) -> state, to name -> state with turns corrected."""

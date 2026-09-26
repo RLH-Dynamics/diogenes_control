@@ -40,6 +40,15 @@ class ActuatorFault(HardwareError):
     """Raised when a motor reports an internal hardware fault (e.g., overtemp)."""
     pass
 
+class MotorDisabled(ActuatorFault):
+    """Raised when a motor that should be running reports itself disabled.
+
+    Its status replies still arrive, so without this check a motor that has
+    dropped out (e.g. its CAN timeout fired) looks healthy while producing no
+    torque.
+    """
+
+
 class SafetyLimitError(HardwareError):
     """Raised by the supervisory layer when states violate safe operating bounds."""
     pass

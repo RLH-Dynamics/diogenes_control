@@ -11,7 +11,7 @@ Raspberry Pi 5.
 | Compute | Raspberry Pi 5 |
 | CAN | Waveshare 2-CH CAN HAT (2 × MCP2515, SPI0, isolated) |
 | Actuators | 6 × RobStride RS03 — `can0`: left leg, `can1`: right leg; on each bus hip = 1, thigh = 2, calf = 3 |
-| IMU | Adafruit BNO085 over I2C |
+| IMU | Adafruit BNO085 over I2C; game rotation vector (no magnetometer), accel + gyro calibration saved on the chip |
 
 Both MCP2515 controllers share the SPI0 master, so their register traffic
 serialises in the kernel even though the CAN buses are electrically independent.
@@ -48,6 +48,8 @@ python main-read-state.py            # passive joint state, nothing moves
 python tools/can_id_scan.py          # read-only: which CAN ids answer on which bus
 python tools/stream_joints.py --host <laptop-ip>   # limp joint state -> live Viser model
 python main-imu-read.py              # IMU bring-up + mount-rotation calibration
+python tools/imu_check.py            # guided pass/fail check of the mount rotation
+python tools/imu_calibrate.py        # one-off accel + gyro calibration, saved on the chip
 python main-set-zero.py --leg left   # set mechanical zero, one leg at a time
 python main-rl.py                    # the policy
 ```
@@ -188,8 +190,5 @@ tools skip the requirement; `main-rl.py --allow-unverified-watchdogs` overrides 
 - `policy.onnx` is still the old single-leg hop policy (11 inputs), and
   `main-rl.py` will refuse it. Export the suspended checkpoint with
   `export_onnx.py --deploy` and copy it here.
-- `IMU.mount_rotation` is the identity placeholder. Measure it with
-  `main-imu-read.py`. The suspended policy does not observe the IMU, but the
-  attitude interlock does, so run `main-rl.py --no-imu` until it is measured.
 - Loop timing and MCP2515 RX-overrun counters have not been measured on the real
   HAT. Watch `ip -details -statistics link show can0` during a soak test.

@@ -88,8 +88,12 @@ class Robot:
                   "The motors may not go limp on their own if the host stops "
                   "transmitting. Continuing because this tool applies no gain.")
 
-        self.network.enable(control_mode=control_mode)
+        # The IMU first: starting it can block for a second or more, and once the
+        # motors are enabled any pause in CAN traffic longer than their timeout
+        # (WATCHDOG_MS) disables them for good. That is what happened on
+        # 2026-09-25 when it came second: the whole run commanded limp motors.
         self.imu.start()
+        self.network.enable(control_mode=control_mode)
 
     def shutdown(self):
         """Disable motors and release both subsystems. Safe to call twice."""
