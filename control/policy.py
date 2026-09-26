@@ -170,6 +170,20 @@ class Policy:
             if not self.period > 0:
                 errors.append(f"phase clock period {v} is not positive")
 
+        # Targets are clamped to the joint ranges the policy was trained with as
+        # well as the contract's: a policy trained with a narrower range (the
+        # hips' 5 deg inward before 2026-09-26) must not be let past it.
+        if (v := meta.get('joint_pos_limits')) is not None:
+            lim = _floats(v)
+            if lim.size != 2 * self.num_joints:
+                errors.append(f"joint_pos_limits: expected {2 * self.num_joints} values")
+            else:
+                self.ctrl_lo = np.maximum(self.ctrl_lo, lim[0::2]).astype(np.float32)
+                self.ctrl_hi = np.minimum(self.ctrl_hi, lim[1::2]).astype(np.float32)
+        else:
+            warnings.append("no joint_pos_limits (older export): clamping to the "
+                            "current joint contract's ranges")
+
         # Commands are clamped to the ranges the policy was trained on.
         self.command_lo = np.zeros(3, dtype=np.float32)
         self.command_hi = np.zeros(3, dtype=np.float32)

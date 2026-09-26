@@ -103,9 +103,11 @@ class Bno085Reader:
             self._i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
             self._sensor = BNO08X_I2C(self._i2c, address=self.spec.i2c_address)
             self._capture_accuracy(self._sensor)
-            self._sensor.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR)
-            self._sensor.enable_feature(BNO_REPORT_GYROSCOPE)
-            self._sensor.enable_feature(BNO_REPORT_ACCELEROMETER)
+            us = lambda s: int(round(s * 1e6))  # noqa: E731
+            self._sensor.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR,
+                                        us(self.spec.fusion_interval_s))
+            self._sensor.enable_feature(BNO_REPORT_GYROSCOPE, us(self.spec.gyro_interval_s))
+            self._sensor.enable_feature(BNO_REPORT_ACCELEROMETER, us(self.spec.accel_interval_s))
             self._report_ids = {"accel": BNO_REPORT_ACCELEROMETER,
                                 "gyro": BNO_REPORT_GYROSCOPE}
         except Exception as e:

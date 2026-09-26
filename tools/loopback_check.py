@@ -247,6 +247,17 @@ def policy_checks(spec):
     check("IMU terms in the chip frame",
           np.allclose(gyro, [0, 1, 0]) and np.allclose(grav, [0, -0.866, 0.5], atol=1e-6),
           f"gyro {gyro.tolist()}, gravity {np.round(grav, 3).tolist()}")
+    # A policy trained with narrower joint ranges is clamped to them.
+    narrow = []
+    for j in spec.names:
+        lo, hi = spec.sim_contract['joints'][j]['ctrl_range']
+        narrow += [lo + 0.1, hi - 0.1]
+    policy = load({**walk_meta, 'joint_pos_limits': ",".join(f"{v:.6f}" for v in narrow)},
+                  w_width, out=np.full(n, 50.0, dtype=np.float32))
+    targets = policy.act(crouch, np.zeros(n))
+    check("targets clamped to the policy's own training ranges",
+          np.allclose(targets, np.array(narrow[1::2]), atol=1e-5),
+          f"{np.round(targets, 3).tolist()}")
     for label, change in [
         ("walking without command ranges", {'command_ranges': None}),
         ("walking with the suspended default pose",

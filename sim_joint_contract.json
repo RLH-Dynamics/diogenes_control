@@ -4,11 +4,11 @@
   "joints": {
     "left_hip": {
       "range": [
-        -0.087266,
+        -0.349066,
         0.785398
       ],
       "ctrl_range": [
-        -0.087266,
+        -0.349066,
         0.785398
       ],
       "foot": "left_foot",
@@ -53,11 +53,11 @@
     "right_hip": {
       "range": [
         -0.785398,
-        0.087266
+        0.349066
       ],
       "ctrl_range": [
         -0.785398,
-        0.087266
+        0.349066
       ],
       "foot": "right_foot",
       "positive_moves_foot": {

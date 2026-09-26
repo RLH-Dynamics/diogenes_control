@@ -140,8 +140,19 @@ class ImuSpec:
     # feeding a locomotion policy is more dangerous than no IMU at all.
     max_age_s: float = 0.06
 
-    # Target report interval requested from the BNO085, in seconds.
+    # How often the reader thread polls the chip, in seconds.
     report_interval_s: float = 0.005
+
+    # Report intervals requested from the BNO085 itself, in seconds. The
+    # driver's default is 50 ms (20 Hz), which the walking logs of 2026-09-26
+    # showed: a new gyro/orientation value only every 2-3 control cycles.
+    # The accelerometer only feeds the calibration status, so it runs slowly.
+    # 50 Hz, one fresh sample per control cycle: measured on the robot, the chip
+    # delivers 100 Hz too, but then the Python reader falls behind on the
+    # 50 kHz I2C bus (its loop dropped to 2.6 Hz) and the data gets older.
+    fusion_interval_s: float = 0.02
+    gyro_interval_s: float = 0.02
+    accel_interval_s: float = 0.1
 
     # How long the reader waits after the first sample before reporting ready.
     # The BNO085's fusion reports an idealised level orientation at first and
