@@ -15,7 +15,8 @@ class Recorder:
         self.log_imu = log_imu and spec.imu is not None
         self.rows = []
 
-        headers = ['time', 'exchange_ms', 'overrun_ms', 'missed']
+        headers = ['time', 'exchange_ms', 'overrun_ms', 'missed', 'phase',
+                   'cmd_vx', 'cmd_vy', 'cmd_wz']
         for name in spec.names:
             headers += [f'meas_pos_{name}', f'meas_vel_{name}',
                         f'meas_torque_{name}', f'temp_{name}', f'cmd_pos_{name}']
@@ -27,7 +28,8 @@ class Recorder:
         self.headers = headers
 
     def record(self, t, state, targets, imu_sample=None,
-               exchange_s=0.0, overrun_s=0.0, missed=()):
+               exchange_s=0.0, overrun_s=0.0, missed=(), phase="",
+               command=(0.0, 0.0, 0.0)):
         """`missed`: joints with no reply this cycle, whose `state` entry is
         their previous reading (see Robot.exchange_tolerant)."""
         row = {
@@ -35,6 +37,10 @@ class Recorder:
             'exchange_ms': exchange_s * 1000.0,
             'overrun_ms': overrun_s * 1000.0,
             'missed': ";".join(missed),
+            'phase': phase,
+            'cmd_vx': float(command[0]),
+            'cmd_vy': float(command[1]),
+            'cmd_wz': float(command[2]),
         }
         for name in self.spec.names:
             reading = state[name]

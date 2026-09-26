@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from robot.model import BusSpec, ImuSpec, JointSpec, RobotSpec, SafetySpec
+from robot.model import BusSpec, ImuSpec, JointSpec, PolicyProfile, RobotSpec, SafetySpec
 
 ### ------------------------------------------------------------- CAN BUSES ###
 # The Waveshare 2-CH CAN HAT presents two MCP2515 controllers as can0/can1.
@@ -187,38 +187,63 @@ LOOP_RATE_HZ = 50
 DT = 1.0 / LOOP_RATE_HZ
 
 ### ------------------------------------------------------------ RL  POLICY ###
-# Matches the Diogenes-Biped-Suspended task (diogenes_mjlab
-# harold_biped/env_cfg.py), checked 2026-09-24. Policy verifies every value
-# below against the metadata export_onnx.py attaches, and refuses a mismatch.
+# One profile per training task. The policy file's metadata names its task
+# (task_id, written by diogenes_mjlab tools/export_onnx.py), which picks the
+# profile here; Policy then checks the file against it -- joint order, default
+# pose, observation terms, history length, control period -- and refuses a
+# mismatch. What legitimately varies between runs of one task (action scale,
+# gait-clock period, command ranges) is read from the file instead.
+#
+# observation_terms are the control-side terms (control/observation.py), in the
+# actor group's order; sim_observation_names the sim's names for them, as
+# exported. Poses are in the SIM frame. start_pose is where the soft start
+# ramps to and holds before the policy takes over.
 MODEL_PATH = "policy.onnx"
-ACTION_SCALE = 1.0             # JointPositionActionCfg scale, default offset on
-CYCLE_PERIOD = 2.0             # gait-clock period (gait.GAIT_PERIOD), seconds
 
-# The actor observation group, in order: each entry is a control-side term
-# (control/observation.py), and SIM_OBSERVATION_NAMES the sim's name for it as
-# exported in the policy metadata. The suspended robot's torso is welded to the
-# world in training, so the actor has no IMU terms.
-OBSERVATION_TERMS = [
-    "joint_pos_rel",        # num_joints
-    "joint_vel_rel",        # num_joints
-    "last_action",          # num_joints
-    "phase_clock",          # 2
-]
-SIM_OBSERVATION_NAMES = ["joint_pos", "joint_vel", "last_action", "gait_clock"]
-
-# Past steps stacked per actor term (OBS_HISTORY_LENGTH in diogenes_mjlab).
-# Input width = 10 x (6 + 6 + 6 + 2) = 200.
-OBSERVATION_HISTORY = 10
-
-# Soft start (control/soft_start.py): before the policy runs, targets ramp from
-# the resting pose to START_POSE over SOFT_START_S, then hold for
-# SOFT_START_HOLD_S. START_POSE is where training episodes start, the gait's
-# nominal pose (diogenes_mjlab gait.nominal_joint_pos(): hips abducted by
-# HIP_ABDUCTION = 10 deg, thighs and calves at 0), in the SIM frame.
-START_POSE = {
+# The suspended gait's nominal pose (diogenes_mjlab gait.nominal_joint_pos():
+# hips abducted by HIP_ABDUCTION = 10 deg, thighs and calves at 0).
+_SUSPENDED_START = {
     "left_hip": np.radians(10.0), "left_thigh": 0.0, "left_calf": 0.0,
     "right_hip": np.radians(-10.0), "right_thigh": 0.0, "right_calf": 0.0,
 }
+# The walking crouch (diogenes_mjlab walk_env_cfg.CROUCH_JOINT_POS): hips at 0,
+# knees bent so the torso rides 7.5 cm lower than straight-legged.
+_WALK_CROUCH = {
+    "left_hip": 0.0, "left_thigh": 0.3105, "left_calf": -0.55192,
+    "right_hip": 0.0, "right_thigh": -0.3105, "right_calf": -0.55192,
+}
+
+POLICY_PROFILES = {
+    # Torso welded to the world in training: no IMU or command terms.
+    # Input width = 10 x (6 + 6 + 6 + 2) = 200.
+    "Diogenes-Biped-Suspended": PolicyProfile(
+        task_id="Diogenes-Biped-Suspended",
+        observation_terms=("joint_pos_rel", "joint_vel_rel", "last_action", "phase_clock"),
+        sim_observation_names=("joint_pos", "joint_vel", "last_action", "gait_clock"),
+        history_length=10,
+        default_pos={name: 0.0 for name in _SUSPENDED_START},
+        start_pose=_SUSPENDED_START,
+        uses_command=False,
+    ),
+    # IMU in the BNO085's own axes (the sim reads it at the chip's site), then
+    # the velocity command. Input width = 10 x (3 + 3 + 6 + 6 + 6 + 3 + 2) = 290.
+    "Diogenes-Biped-Walk": PolicyProfile(
+        task_id="Diogenes-Biped-Walk",
+        observation_terms=("imu_ang_vel_chip", "imu_gravity_chip", "joint_pos_rel",
+                           "joint_vel_rel", "last_action", "velocity_commands",
+                           "phase_clock"),
+        sim_observation_names=("imu_ang_vel", "imu_gravity", "joint_pos", "joint_vel",
+                               "actions", "command", "gait_clock"),
+        history_length=10,
+        default_pos=_WALK_CROUCH,
+        start_pose=_WALK_CROUCH,
+        uses_command=True,
+    ),
+}
+
+# Soft start (control/soft_start.py): before the policy runs, targets ramp from
+# the resting pose to the profile's start_pose over SOFT_START_S, then hold for
+# at least SOFT_START_HOLD_S (a walking policy waits there for START).
 SOFT_START_S = 2.0
 SOFT_START_HOLD_S = 0.5
 

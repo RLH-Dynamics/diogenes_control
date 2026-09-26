@@ -98,6 +98,8 @@ def obs_context(spec, sim_pos, sim_vel, phase=(0.0, 1.0)):
         last_raw_action=np.zeros(n, dtype=np.float32),
         base_ang_vel=np.zeros(3, dtype=np.float32),
         projected_gravity=np.array([0, 0, -1], dtype=np.float32),
+        imu_ang_vel_chip=np.zeros(3, dtype=np.float32),
+        imu_gravity_chip=np.array([0, -1, 0], dtype=np.float32),
         phase=np.asarray(phase, dtype=np.float32),
         commands=np.zeros(3, dtype=np.float32),
     )
@@ -123,8 +125,13 @@ def history_checks(spec):
     check("reset refills the history", np.allclose(step(7.0)[:H * n], 7.0))
 
 
+SUSPENDED = config.POLICY_PROFILES["Diogenes-Biped-Suspended"]
+WALK = config.POLICY_PROFILES["Diogenes-Biped-Walk"]
+
+
 def policy_checks(spec):
-    """Policy against a stand-in ONNX: metadata gate and ctrlrange clamp."""
+    """Policy against stand-in ONNX files: profile selection, metadata gate,
+    action transform, command clamp and the chip-frame IMU terms."""
     print("\n--- Policy wiring ---")
     try:
         import onnx
@@ -135,31 +142,20 @@ def policy_checks(spec):
         return
     import tempfile
     from control.policy import Policy
+    from sensors.base import ImuSample
 
     n = spec.num_joints
-    width = max(1, config.OBSERVATION_HISTORY) * (3 * n + 2)
     # Constant output of 5 rad per joint: past every ctrl range.
     bias = np.full(n, 5.0, dtype=np.float32)
-    good_meta = {
-        'joint_names': ",".join(spec.names),
-        'default_joint_pos': ",".join("0.000" for _ in range(n)),
-        'action_scale': "1.0",
-        'observation_names': ",".join(config.SIM_OBSERVATION_NAMES),
-        'actor_history_length': str(config.OBSERVATION_HISTORY),
-        'phase_period': str(config.CYCLE_PERIOD),
-        'step_dt': str(spec.dt),
-        'joint_stiffness': ",".join(f"{spec.kp:.3f}" for _ in range(n)),
-        'joint_damping': ",".join(f"{spec.kd:.3f}" for _ in range(n)),
-    }
 
-    def make_model(meta):
+    def make_model(meta, width, out=bias):
         graph = helper.make_graph(
             [helper.make_node("Gemm", ["obs", "W", "b"], ["actions"])],
             "standin",
             [helper.make_tensor_value_info("obs", TensorProto.FLOAT, [1, width])],
             [helper.make_tensor_value_info("actions", TensorProto.FLOAT, [1, n])],
             [helper.make_tensor("W", TensorProto.FLOAT, [width, n], [0.0] * (width * n)),
-             helper.make_tensor("b", TensorProto.FLOAT, [n], bias.tolist())],
+             helper.make_tensor("b", TensorProto.FLOAT, [n], np.asarray(out).tolist())],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
@@ -169,13 +165,39 @@ def policy_checks(spec):
         onnx.save(model, path)
         return path
 
-    def load(meta):
-        return Policy(spec, make_model(meta), config.OBSERVATION_TERMS,
-                      config.ACTION_SCALE, config.CYCLE_PERIOD,
-                      config.OBSERVATION_HISTORY, config.SIM_OBSERVATION_NAMES)
+    def meta_for(profile, **extra):
+        meta = {
+            'task_id': profile.task_id,
+            'joint_names': ",".join(spec.names),
+            'default_joint_pos': ",".join(
+                f"{profile.default_pos[j]:.5f}" for j in spec.names),
+            'action_scale': "1.0",
+            'observation_names': ",".join(profile.sim_observation_names),
+            'actor_history_length': str(profile.history_length),
+            'phase_period': "2.0",
+            'step_dt': str(spec.dt),
+            'joint_stiffness': ",".join(f"{spec.kp:.3f}" for _ in range(n)),
+            'joint_damping': ",".join(f"{spec.kd:.3f}" for _ in range(n)),
+        }
+        meta.update(extra)
+        return {k: v for k, v in meta.items() if v is not None}
 
-    policy = load(good_meta)
-    check("matching export accepted", True)
+    def load(meta, width, out=bias):
+        return Policy(spec, make_model(meta, width, out), config.POLICY_PROFILES)
+
+    def refused(meta, width):
+        meta = {k: v for k, v in meta.items() if v is not None}
+        try:
+            load(meta, width)
+            return False
+        except SystemExit:
+            return True
+
+    # Suspended: 10 x (6 + 6 + 6 + 2).
+    s_width = max(1, SUSPENDED.history_length) * (3 * n + 2)
+    policy = load(meta_for(SUSPENDED), s_width)
+    check("suspended export accepted, its profile picked",
+          policy.profile is SUSPENDED and policy.builder.total_width == s_width)
     targets = policy.act(np.zeros(n), np.zeros(n))
     check("targets clamped to the sim ctrl range",
           np.allclose(targets, policy.ctrl_hi), f"{np.round(targets, 3).tolist()}")
@@ -189,14 +211,89 @@ def policy_checks(spec):
         ("wrong history length", {'actor_history_length': "5"}),
         ("wrong observation terms", {'observation_names': "joint_pos,joint_vel"}),
         ("missing metadata", {'phase_period': None}),
+        ("unknown task", {'task_id': "Diogenes-Biped-Somersault"}),
     ]:
-        meta = {k: v for k, v in {**good_meta, **change}.items() if v is not None}
-        try:
-            load(meta)
-            refused = False
-        except SystemExit:
-            refused = True
-        check(f"{label} refused", refused)
+        check(f"{label} refused", refused(meta_for(SUSPENDED, **change), s_width))
+
+    # Walking: 10 x (3 + 3 + 6 + 6 + 6 + 3 + 2) = 290, crouch default, per-joint
+    # scale, command ranges.
+    w_width = max(1, WALK.history_length) * (3 + 3 + 3 * n + 3 + 2)
+    scale = [0.25, 0.5, 0.5, 0.25, 0.5, 0.5]
+    walk_meta = meta_for(WALK, action_scale=",".join(map(str, scale)),
+                         phase_period="0.714286",
+                         command_ranges="-0.1,0.3,0.0,0.0,-0.5,0.5")
+    small = np.array([0.1, 0.2, -0.2, -0.1, -0.2, -0.2], dtype=np.float32)
+    policy = load(walk_meta, w_width, out=small)
+    check("walking export accepted, its profile picked",
+          policy.profile is WALK and policy.builder.total_width == w_width)
+    crouch = WALK.pose_vector(WALK.default_pos, spec.names)
+    targets = policy.act(crouch, np.zeros(n))
+    check("targets = crouch + per-joint scale x action",
+          np.allclose(targets, crouch + np.array(scale) * small, atol=1e-6),
+          f"{np.round(targets, 4).tolist()}")
+    policy.set_command(0.8, 0.2, -1.0)
+    check("command clamped to the trained ranges",
+          np.allclose(policy.command, [0.3, 0.0, -0.5]), f"{policy.command.tolist()}")
+    # Turning left while tipped nose down: base frame gyro +z, gravity +x.
+    imu = ImuSample(t=0.0, quat=np.array([1.0, 0, 0, 0]), ang_vel=np.array([0.0, 0.0, 1.0]),
+                    lin_accel=np.zeros(3), projected_gravity=np.array([0.5, 0.0, -0.866]))
+    policy.reset()
+    obs = policy.builder._buffer
+    policy.act(crouch, np.zeros(n), imu)
+    H = WALK.history_length
+    gyro = obs[0, (H - 1) * 3:H * 3]
+    grav = obs[0, H * 3 + (H - 1) * 3:H * 6]
+    # BNO085 axes: +x left, +y up, +z forward.
+    check("IMU terms in the chip frame",
+          np.allclose(gyro, [0, 1, 0]) and np.allclose(grav, [0, -0.866, 0.5], atol=1e-6),
+          f"gyro {gyro.tolist()}, gravity {np.round(grav, 3).tolist()}")
+    for label, change in [
+        ("walking without command ranges", {'command_ranges': None}),
+        ("walking with the suspended default pose",
+         {'default_joint_pos': ",".join("0.0" for _ in range(n))}),
+    ]:
+        check(f"{label} refused", refused({**walk_meta, **change}, w_width))
+
+
+def teleop_checks():
+    """The UDP command link: deadman, link timeout, START/STOP, sender lock."""
+    print("\n--- Teleop link ---")
+    import socket
+    from control.command_source import (
+        BUTTON_DEADMAN, BUTTON_START, BUTTON_STOP, UdpCommandSource, encode,
+    )
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    src = UdpCommandSource(port=port, timeout_s=0.2)
+    src.start()
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(seq, vx, wz, buttons):
+        tx.sendto(encode(seq, vx, 0.0, wz, buttons), ("127.0.0.1", port))
+        time.sleep(0.05)
+
+    try:
+        check("no packets: step in place", src.command() == (0.0, 0.0, 0.0))
+        send(1, 0.2, 0.3, 0)
+        check("deadman released: step in place", src.command() == (0.0, 0.0, 0.0))
+        send(2, 0.2, 0.3, BUTTON_DEADMAN)
+        vx, _, wz = src.command()
+        check("deadman held: command passes", abs(vx - 0.2) < 1e-6 and abs(wz - 0.3) < 1e-6)
+        send(1, 0.9, 0.9, BUTTON_DEADMAN)
+        check("stale packet ignored", abs(src.command()[0] - 0.2) < 1e-6)
+        time.sleep(0.25)
+        check("link lost: step in place", src.command() == (0.0, 0.0, 0.0))
+        check("START not yet given", not src.start_requested())
+        send(3, 0.0, 0.0, BUTTON_START)
+        send(4, 0.0, 0.0, 0)
+        check("START latched", src.start_requested() and not src.stop_requested())
+        send(5, 0.0, 0.0, BUTTON_STOP)
+        check("STOP latched", src.stop_requested())
+    finally:
+        src.stop()
+        tx.close()
 
 
 def turn_checks(spec):
@@ -362,7 +459,7 @@ def soft_start_checks(spec):
     print("\n--- Soft start ---")
     from control.soft_start import SoftStart
     rest = np.radians([6, 13, -17, -8, -15, -23]).astype(np.float32)
-    goal = np.array([config.START_POSE[n] for n in spec.names], dtype=np.float32)
+    goal = SUSPENDED.pose_vector(SUSPENDED.start_pose, spec.names)
     ramp = SoftStart(rest, goal, config.SOFT_START_S, config.SOFT_START_HOLD_S)
     check("starts at the resting pose", np.allclose(ramp.target(0.0), rest))
     check("reaches the start pose and holds it",
@@ -479,8 +576,8 @@ def main():
               f"{state[probe]['pos']:.4f} vs {probe_hw:.4f}")
 
         print("\n--- Observation layout ---")
-        history = config.OBSERVATION_HISTORY
-        builder = ObservationBuilder(spec, config.OBSERVATION_TERMS, history)
+        history = SUSPENDED.history_length
+        builder = ObservationBuilder(spec, list(SUSPENDED.observation_terms), history)
         sim_pos, sim_vel = robot.to_sim_frame(*robot.state_arrays(state))
         obs = builder.build(obs_context(spec, sim_pos, sim_vel)).copy()
         n = spec.num_joints
@@ -565,6 +662,7 @@ def main():
     watchdog_checks(spec)
     contract_checks(spec)
     policy_checks(spec)
+    teleop_checks()
     turn_checks(spec)
     offset_checks(spec)
     soft_start_checks(spec)

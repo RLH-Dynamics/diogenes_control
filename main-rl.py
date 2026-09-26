@@ -25,11 +25,22 @@ applied in the same step its observation was taken.
 
 SOFT START
 ----------
-The loop opens with a soft start: targets ramp from the resting pose to
-config.START_POSE (the default pose for --dry-run) and hold there, and only
-then is the policy reset and run, so it starts where training episodes start.
-Safety checks, fault checks and logging run identically in both phases, and the
-soft start counts towards --duration.
+The loop opens with a soft start: targets ramp from the resting pose to the
+policy profile's start pose (the default pose for --dry-run) and hold there, and
+only then is the policy reset and run, so it starts where training episodes
+start. Safety checks, fault checks and logging run identically in every phase,
+and the soft start counts towards --duration.
+
+WALKING
+-------
+A walking policy (its profile takes a velocity command) needs a command source:
+--teleop (tools/gamepad_teleop.py on the laptop) or --command VX,WZ for a fixed
+command. With --teleop the loop holds the crouch after the soft start until
+START is pressed: lower the robot on its rope until the feet carry it, then
+press START. B (STOP) ends the run at any time; the motors then go limp.
+
+    python main-rl.py --model policy_walk.onnx --teleop   # on the Pi
+    python3 tools/gamepad_teleop.py                       # on the laptop
 """
 
 import argparse
@@ -40,10 +51,10 @@ import time
 import numpy as np
 
 from config import (
-    ACTION_SCALE, CYCLE_PERIOD, MAX_CONSECUTIVE_MISSED_REPLIES, MODEL_PATH,
-    OBSERVATION_HISTORY, OBSERVATION_TERMS, SIM_OBSERVATION_NAMES,
-    SOFT_START_HOLD_S, SOFT_START_S, SPEC, START_POSE,
+    MAX_CONSECUTIVE_MISSED_REPLIES, MODEL_PATH, POLICY_PROFILES,
+    SOFT_START_HOLD_S, SOFT_START_S, SPEC,
 )
+from control.command_source import DEFAULT_PORT, FixedCommandSource, UdpCommandSource
 from control.policy import HoldPolicy, Policy
 from control.soft_start import SoftStart
 from robot.session import RobotSession
@@ -79,7 +90,34 @@ def parse_args():
     p.add_argument('--virtual', action='store_true',
                    help="Run against tools/fake_motors.py over an in-process "
                         "virtual CAN bus. No hardware required; implies --no-imu.")
+    p.add_argument('--teleop', action='store_true',
+                   help="Walking: take commands from tools/gamepad_teleop.py over "
+                        "UDP, and wait for START after the soft start.")
+    p.add_argument('--teleop-port', type=int, default=DEFAULT_PORT)
+    p.add_argument('--teleop-peer', default=None,
+                   help="Only accept teleop packets from this address (default: "
+                        "lock onto the first sender).")
+    p.add_argument('--command', default=None, metavar="VX,WZ",
+                   help="Walking: a fixed command (m/s, rad/s) instead of teleop; "
+                        "the policy starts right after the soft start.")
     return p.parse_args()
+
+
+def command_source(args, policy):
+    """The velocity-command source a walking policy needs, or None."""
+    profile = getattr(policy, "profile", None)
+    if profile is None or not profile.uses_command:
+        if args.teleop or args.command:
+            print("[WARN] This policy takes no velocity command; ignoring "
+                  "--teleop/--command.")
+        return None
+    if args.command:
+        vx, wz = (float(v) for v in args.command.split(','))
+        return FixedCommandSource(vx=vx, wz=wz)
+    if args.teleop:
+        return UdpCommandSource(port=args.teleop_port, peer=args.teleop_peer)
+    print("[ERROR] A walking policy needs --teleop or --command VX,WZ.")
+    sys.exit(1)
 
 
 def build_spec(virtual: bool):
@@ -107,21 +145,17 @@ def main():
         print("[INFO] DRY RUN: commanding the default pose, no policy loaded.")
         policy = HoldPolicy(spec)
     else:
-        policy = Policy(
-            spec=spec,
-            model_path=args.model,
-            term_names=OBSERVATION_TERMS,
-            action_scale=ACTION_SCALE,
-            period=CYCLE_PERIOD,
-            history_length=OBSERVATION_HISTORY,
-            sim_observation_names=SIM_OBSERVATION_NAMES,
-        )
+        policy = Policy(spec=spec, model_path=args.model, profiles=POLICY_PROFILES)
+    commands = command_source(args, policy)
+    wait_for_start = isinstance(commands, UdpCommandSource)
 
     safety = SafetyMonitor(spec)
     recorder = None if args.no_log else Recorder(spec)
     pacer = LoopPacer(spec.dt)
 
     exit_code = 0
+    if commands is not None:
+        commands.start()
     try:
         with RobotSession(spec, use_imu=use_imu,
                           allow_unverified_watchdogs=args.allow_unverified_watchdogs) as robot:
@@ -140,10 +174,11 @@ def main():
             # pose before the policy takes over.
             targets = robot.hold_targets(state)
             rest_sim, _ = robot.to_sim_frame(*robot.state_arrays(state))
-            goal_sim = (spec.default_pos_vector() if args.dry_run else
-                        np.array([START_POSE[n] for n in spec.names], dtype=np.float32))
+            goal_sim = spec.default_pos_vector() if args.dry_run else policy.start_pose
             soft_start = SoftStart(rest_sim, goal_sim, SOFT_START_S, SOFT_START_HOLD_S)
             policy_running = False
+            announced_wait = False
+            last_status = 0.0
 
             print(f"[INFO] Soft start: ramping to the "
                   f"{'default' if args.dry_run else 'start'} pose over "
@@ -155,6 +190,10 @@ def main():
             last_state = state
 
             while True:
+                if commands is not None and commands.stop_requested():
+                    print("\n[INFO] STOP from the controller.")
+                    break
+
                 # 1. Apply last cycle's setpoints and collect the state they
                 #    provoke. An isolated missing reply is ridden through on the
                 #    joint's previous reading; MAX_CONSECUTIVE in a row stops.
@@ -177,8 +216,14 @@ def main():
                 # 3. Soft-start ramp, then the policy; both in the sim frame.
                 sim_pos, sim_vel = robot.to_sim_frame(*robot.state_arrays(state))
                 elapsed = time.perf_counter() - start_time
-                if not soft_start.done(elapsed):
+                ready = soft_start.done(elapsed) and (
+                    not wait_for_start or commands.start_requested())
+                if not ready:
                     sim_targets = soft_start.target(elapsed)
+                    if soft_start.done(elapsed) and not announced_wait:
+                        announced_wait = True
+                        print("[INFO] Holding the start pose. Lower the robot until "
+                              "its feet carry it, then press START (B stops).")
                 else:
                     if not policy_running:
                         # Fresh clock and observation history, as at an episode start.
@@ -186,6 +231,8 @@ def main():
                         policy_running = True
                         print(f"[INFO] Soft start complete; "
                               f"{'holding' if args.dry_run else 'policy running'}.")
+                    if commands is not None:
+                        policy.set_command(*commands.command())
                     sim_targets = policy.act(sim_pos, sim_vel, imu_sample)
 
                 # 4. Back to the hardware frame, and validate before it can move
@@ -207,7 +254,13 @@ def main():
                         exchange_s=robot.network.last_exchange_s,
                         overrun_s=overrun_s,
                         missed=miss.missing if miss is not None else (),
+                        phase="policy" if policy_running else "soft_start",
+                        command=policy.command if policy_running and commands else (0.0, 0.0, 0.0),
                     )
+                if commands is not None and now - last_status > 1.0:
+                    last_status = now
+                    print(f"\r[{now - start_time:6.1f} s] {commands.status()}      ",
+                          end="", flush=True)
 
                 if args.duration is not None and (now - start_time) >= args.duration:
                     print(f"\n[INFO] Reached {args.duration:.1f} s limit.")
@@ -225,6 +278,8 @@ def main():
         print(f"\n[FATAL] Unexpected error: {e}")
         exit_code = 4
     finally:
+        if commands is not None:
+            commands.stop()
         if simulator is not None:
             simulator.stop()
         restore_gc()

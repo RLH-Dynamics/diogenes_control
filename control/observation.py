@@ -7,7 +7,8 @@ policy is retrained. Previously it was a hand-maintained `np.concatenate` plus a
 docstring describing the index math. At three joints and four terms that was
 tractable; at six joints with IMU terms it is where the bugs come from.
 
-Here the layout is a list of term names in `config.OBSERVATION_TERMS`. Each term
+Here the layout is a list of term names in a policy profile
+(`config.POLICY_PROFILES`). Each term
 declares its own width, the builder sums them, and `Policy` checks that total
 against the ONNX model's declared input width before any torque is applied. A
 mismatch names the terms rather than just printing two numbers.
@@ -47,6 +48,8 @@ class ObsContext:
     last_raw_action: np.ndarray  # (n,)
     base_ang_vel: np.ndarray     # (3,) base frame
     projected_gravity: np.ndarray  # (3,) base frame
+    imu_ang_vel_chip: np.ndarray   # (3,) the BNO085's own axes
+    imu_gravity_chip: np.ndarray   # (3,) the BNO085's own axes
     phase: np.ndarray            # (2,) [sin, cos]
     commands: np.ndarray         # (3,) [vx, vy, wz] velocity command
 
@@ -60,7 +63,7 @@ class ObsTerm:
 
 # The registry of terms this deployment knows how to produce. Adding a term the
 # retrained policy needs means adding one entry here, then naming it in
-# config.OBSERVATION_TERMS.
+# the profile's observation_terms.
 TERM_REGISTRY: dict[str, ObsTerm] = {
     'joint_pos_rel': ObsTerm(
         'joint_pos_rel', lambda n: n,
@@ -84,6 +87,15 @@ TERM_REGISTRY: dict[str, ObsTerm] = {
     'projected_gravity': ObsTerm(
         'projected_gravity', lambda n: 3,
         lambda c: c.projected_gravity),
+    # The walking policy reads the IMU as the sim does, at the chip's site in
+    # its own axes (+x left, +y up, +z forward on Harold): the base-frame
+    # sample rotated back through the mount rotation.
+    'imu_ang_vel_chip': ObsTerm(
+        'imu_ang_vel_chip', lambda n: 3,
+        lambda c: c.imu_ang_vel_chip),
+    'imu_gravity_chip': ObsTerm(
+        'imu_gravity_chip', lambda n: 3,
+        lambda c: c.imu_gravity_chip),
     'phase_clock': ObsTerm(
         'phase_clock', lambda n: 2,
         lambda c: c.phase),
@@ -104,7 +116,7 @@ class ObservationBuilder:
                 f"Known terms: {sorted(TERM_REGISTRY)}"
             )
         if not term_names:
-            raise ValueError("OBSERVATION_TERMS is empty.")
+            raise ValueError("The observation layout is empty.")
 
         self.spec = spec
         self.num_joints = spec.num_joints
@@ -121,7 +133,8 @@ class ObservationBuilder:
                          for w in self.widths]
         self._primed = False
 
-        needs_imu = {'base_ang_vel', 'projected_gravity'}
+        needs_imu = {'base_ang_vel', 'projected_gravity',
+                     'imu_ang_vel_chip', 'imu_gravity_chip'}
         self.requires_imu = bool(needs_imu.intersection(term_names))
         if self.requires_imu and spec.imu is None:
             raise ValueError(

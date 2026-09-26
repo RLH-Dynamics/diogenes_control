@@ -104,6 +104,28 @@ class JointSpec:
 
 
 @dataclass(frozen=True)
+class PolicyProfile:
+    """What a policy from one training task needs from this deployment.
+
+    Picked by the task_id in the policy file's metadata (config.POLICY_PROFILES)
+    and checked against the rest of that metadata when the policy loads.
+    """
+    task_id: str
+    observation_terms: tuple        # control-side terms, actor-group order
+    sim_observation_names: tuple    # the sim's names for them, as exported
+    history_length: int             # past steps stacked per term (0 = none)
+    default_pos: dict               # joint -> rad, SIM frame; action offset
+    start_pose: dict                # joint -> rad, SIM frame; soft-start target
+    uses_command: bool              # takes a velocity command (walking)
+
+    def pose_vector(self, pose: dict, names) -> np.ndarray:
+        missing = set(names) - set(pose)
+        if missing:
+            raise ValueError(f"{self.task_id}: pose is missing joints {sorted(missing)}")
+        return np.array([pose[n] for n in names], dtype=np.float32)
+
+
+@dataclass(frozen=True)
 class ImuSpec:
     """Configuration for the base-mounted IMU."""
     i2c_address: int = 0x4A

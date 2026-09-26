@@ -51,13 +51,40 @@ python main-imu-read.py              # IMU bring-up + mount-rotation calibration
 python tools/imu_check.py            # guided pass/fail check of the mount rotation
 python tools/imu_calibrate.py        # one-off accel + gyro calibration, saved on the chip
 python main-set-zero.py --leg left   # set mechanical zero, one leg at a time
-python main-rl.py                    # the policy
+python main-rl.py                    # the suspended policy (policy.onnx)
+python main-rl.py --model policy_walk.onnx --teleop   # walking, driven from the laptop
 ```
 
 Useful `main-rl.py` flags: `--dry-run` commands the default pose instead of
 loading a policy, `--virtual` runs against simulated actuators with no hardware,
 `--no-imu` substitutes a synthetic level IMU, `--duration N` stops after N
-seconds.
+seconds, `--command VX,WZ` gives a walking policy a fixed command instead of
+the gamepad.
+
+The policy file names its training task; `config.POLICY_PROFILES` holds each
+task's observation layout, default and start poses, and the policy is refused if
+its metadata disagrees. Action scale, gait-clock period and command ranges are
+read from the file.
+
+### Walking
+
+`policy_walk.onnx` is the Diogenes-Biped-Walk policy (v3 rewards, 1.8 steps/s,
+trained 2026-09-26). On the laptop, with the gamepad plugged in:
+
+```bash
+python3 tools/gamepad_teleop.py --probe       # once: check the stick/button numbers
+python3 tools/gamepad_teleop.py --pi <pi-ip>  # then drive
+```
+
+On the Pi, `main-rl.py --model policy_walk.onnx --teleop` soft-starts into the
+crouch and holds it. Lower the robot on its rope until the feet carry it, then
+press START. Hold LB (deadman) and use the left stick for speed (-0.1..0.3 m/s)
+and the right stick to turn (+-0.5 rad/s); released, or with the link lost for
+0.5 s, it steps in place. B stops the run and the motors go limp.
+
+`tools/sim2sim_walk.py` runs a walking policy through this stack's policy code
+against the training robot in MuJoCo (model from diogenes_mjlab
+`tools/export_walk_model.py`), with a scripted command sequence.
 
 For tighter loop timing, launch under `sudo chrt -f 80 .venv/bin/python ...`.
 
@@ -187,8 +214,7 @@ tools skip the requirement; `main-rl.py --allow-unverified-watchdogs` overrides 
 
 ## Open items
 
-- `policy.onnx` is still the old single-leg hop policy (11 inputs), and
-  `main-rl.py` will refuse it. Export the suspended checkpoint with
-  `export_onnx.py --deploy` and copy it here.
+- The walking policy has not yet run on the robot: first test on the rope,
+  stepping in place before any forward command.
 - Loop timing and MCP2515 RX-overrun counters have not been measured on the real
   HAT. Watch `ip -details -statistics link show can0` during a soak test.
