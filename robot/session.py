@@ -18,16 +18,21 @@ from utils.realtime import configure_realtime
 class RobotSession:
     def __init__(self, spec, control_mode: str = 'MIT', use_imu: bool = True,
                  imu=None, realtime: bool = True, limp_only: bool = False,
-                 allow_unverified_watchdogs: bool = False):
+                 allow_unverified_watchdogs: bool = False, raw_frame: bool = False):
         """`limp_only`: the caller never applies gain, so the start-up gates
-        (watchdogs, verified joint directions) warn instead of refusing. See
-        Robot.start. `allow_unverified_watchdogs` relaxes only the watchdog gate.
+        (watchdogs, verified joint directions and zero offsets) warn instead of
+        refusing. See Robot.start. `allow_unverified_watchdogs` relaxes only the
+        watchdog gate. `raw_frame`: the caller works in the motors' own frame
+        and never uses the sim frame (zero calibration), so no whole-turn
+        correction is applied and the direction/offset gate only warns; the
+        watchdog gate still applies.
         """
         self.spec = spec
         self.control_mode = control_mode
         self.realtime = realtime
         self.require_watchdogs = not (limp_only or allow_unverified_watchdogs)
-        self.require_verified_directions = not limp_only
+        self.require_verified_directions = not (limp_only or raw_frame)
+        self.resolve_turns = not raw_frame
 
         if imu is not None:
             self.imu = imu
@@ -50,6 +55,7 @@ class RobotSession:
                 control_mode=self.control_mode,
                 require_watchdogs=self.require_watchdogs,
                 require_verified_directions=self.require_verified_directions,
+                resolve_turns=self.resolve_turns,
             )
         except Exception:
             # A partially-open robot still has motors that may be enabled.

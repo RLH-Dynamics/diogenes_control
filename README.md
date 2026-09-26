@@ -39,7 +39,10 @@ successful initialisations.
 ## Running
 
 ```bash
-source setup.sh                      # brings up can0 + can1, activates .venv
+source setup.sh                      # after EVERY boot: brings up can0 + can1, sets the
+                                     # performance governor and real-time priority for
+                                     # the SPI/CAN threads, activates .venv
+                                     # (HAROLD_VENV=/path/to/venv to use another)
 
 python main-read-state.py            # passive joint state, nothing moves
 python tools/can_id_scan.py          # read-only: which CAN ids answer on which bus
@@ -55,6 +58,20 @@ loading a policy, `--virtual` runs against simulated actuators with no hardware,
 seconds.
 
 For tighter loop timing, launch under `sudo chrt -f 80 .venv/bin/python ...`.
+
+### Zero calibration
+
+`tools/calibrate_zeros.py` sets each motor's zero at a physical reference, one
+joint at a time: hips against a straight edge (sim zero), then thighs pushed
+against the body (102.9 deg from sim zero) while the hips are held firm, then
+calves pushed to their stop (75 deg) while the thighs are held. `sim_offset` in
+`config.py` places each reference in the sim frame; the offset signs are
+confirmed afterwards in the live viewer and recorded by setting
+`ZERO_OFFSETS_VERIFIED`, without which `main-rl.py` refuses to apply gain.
+
+At every start-up each motor's position is also corrected by whole turns into
+±180 deg of its zero, since RobStride motors only know their angle to within
+one turn at power-up. Every calibrated working position lies inside that band.
 
 ### Live joint visualisation
 
@@ -106,6 +123,7 @@ tools/
   fake_motors.py     simulated RS03 bus
   loopback_check.py  end-to-end smoke test
   can_id_scan.py     read-only CAN id discovery per bus
+  calibrate_zeros.py interactive zero calibration at physical references
   stream_joints.py   limp joint state -> live Viser viewer
 legacy/              pre-dual-bus scripts, kept for reference (see its README)
 ```
@@ -137,11 +155,23 @@ plus a `direction_signature` hash of those signs.
 - On the sim side, `tests/test_joint_contract.py` pins the contract, so the
   change is caught when it happens rather than on the robot.
 
-### Observation layout
+### Observation layout and policy metadata
 
 `config.OBSERVATION_TERMS` names the terms in order; `control/observation.py`
-owns their widths. The total is checked against the ONNX model's declared input
-width at startup, before any bus is opened, and a mismatch is fatal.
+owns their widths. With `OBSERVATION_HISTORY` > 0 each term is stacked over the
+last N steps exactly as mjlab does it: term-major, oldest first, and backfilled
+from the first observation after a reset. The suspended policy uses 10 steps of
+joint pos, joint vel, last action and gait clock: 200 inputs, no IMU.
+
+At startup `Policy` checks the ONNX input width and the metadata that
+`diogenes_mjlab/src/diogenes_mjlab/tools/export_onnx.py` attaches (joint order,
+default pose, action scale, observation terms, history length, clock period,
+control period) against `config.py`. Any mismatch is fatal; a gain mismatch
+only warns, as gains were randomised ±30% in training.
+
+Policy targets are clamped to each actuator's sim `ctrlrange` (from the joint
+contract), as the sim's position actuators do, before the safety layer sees
+them.
 
 ### Motor-side CAN timeout
 
@@ -155,9 +185,11 @@ tools skip the requirement; `main-rl.py --allow-unverified-watchdogs` overrides 
 
 ## Open items
 
-- `POLICY_JOINT_ORDER` and `OBSERVATION_TERMS` are the expected six-joint + IMU
-  layout, not a verified one. Confirm both against the retrained MJLab env.
+- `policy.onnx` is still the old single-leg hop policy (11 inputs), and
+  `main-rl.py` will refuse it. Export the suspended checkpoint with
+  `export_onnx.py --deploy` and copy it here.
 - `IMU.mount_rotation` is the identity placeholder. Measure it with
-  `main-imu-read.py`.
+  `main-imu-read.py`. The suspended policy does not observe the IMU, but the
+  attitude interlock does, so run `main-rl.py --no-imu` until it is measured.
 - Loop timing and MCP2515 RX-overrun counters have not been measured on the real
   HAT. Watch `ip -details -statistics link show can0` during a soak test.

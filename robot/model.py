@@ -33,6 +33,18 @@ the two differ, and `Robot.start` then refuses to apply gain.
 Position limits are declared in the SIM frame, where they can be checked against
 the contract, and converted to the hardware frame through `direction`. A sign
 fix therefore can never leave the limits pointing the wrong way.
+
+ZERO OFFSETS
+------------
+A motor's zero is set at a physical reference (tools/calibrate_zeros.py): the
+hips against a straight edge at sim zero, the thighs and calves against hard
+stops outside the sim range. `sim_offset` is the sim-frame angle of the motor's
+zero, so
+
+    sim = direction * hw + sim_offset        hw = direction * (sim - sim_offset)
+
+`RobotSpec.zero_offsets_verified` records whether the offsets' signs were
+checked on the robot; like unverified directions, Robot.start then refuses gain.
 """
 
 from dataclasses import dataclass, field
@@ -76,6 +88,9 @@ class JointSpec:
     # Hard velocity bounds, radians/second. Symmetric, so frame-independent.
     vel_limits: tuple[float, float]
 
+    # Sim-frame angle at which the motor reads zero, radians. See module docstring.
+    sim_offset: float = 0.0
+
     @property
     def key(self) -> tuple[str, int]:
         """Transport-level identity: the channel plus the CAN id on it."""
@@ -84,7 +99,7 @@ class JointSpec:
     @property
     def pos_limits(self) -> tuple[float, float]:
         """Position bounds in the HARDWARE frame (what the motor reports)."""
-        a, b = (lim * self.direction for lim in self.sim_pos_limits)
+        a, b = (self.direction * (lim - self.sim_offset) for lim in self.sim_pos_limits)
         return (min(a, b), max(a, b))
 
 
@@ -142,6 +157,8 @@ class RobotSpec:
     directions_verified_signature: Optional[str] = None
     # How far past the sim range a joint's sim_pos_limits may reach, radians.
     sim_limit_margin: float = 0.0
+    # Whether each joint's sim_offset sign was checked on the robot.
+    zero_offsets_verified: bool = True
 
     def __post_init__(self):
         self._validate()
@@ -291,6 +308,9 @@ class RobotSpec:
 
     def default_pos_vector(self) -> np.ndarray:
         return np.array([j.default_pos for j in self.joints], dtype=np.float32)
+
+    def offset_vector(self) -> np.ndarray:
+        return np.array([j.sim_offset for j in self.joints], dtype=np.float32)
 
     def direction_vector(self) -> np.ndarray:
         return np.array([j.direction for j in self.joints], dtype=np.float32)

@@ -5,6 +5,10 @@ still at the intended zero pose before confirming.
 
 Now scoped: `--leg left` or `--joint left_calf` zeroes a subset, which matters
 with two legs since you will usually be jigging one at a time.
+
+This zeroes a joint WHEREVER IT IS. Thighs and calves are zeroed against hard
+stops by tools/calibrate_zeros.py instead (their config `sim_offset` is not 0),
+so they are refused here unless --force.
 """
 
 import argparse
@@ -28,6 +32,8 @@ def parse_args():
     g.add_argument('--joint', choices=SPEC.names, action='append',
                    help="Zero only this joint (repeatable).")
     p.add_argument('--yes', action='store_true', help="Skip the confirmation prompt.")
+    p.add_argument('--force', action='store_true',
+                   help="Allow joints whose zero reference is not sim zero.")
     return p.parse_args()
 
 
@@ -42,6 +48,11 @@ def selected_joints(args):
 def main():
     args = parse_args()
     targets = selected_joints(args)
+    offset = [j.name for j in targets if j.sim_offset != 0.0]
+    if offset and not args.force:
+        print(f"[ERROR] {offset} are zeroed against hard stops, not where they are "
+              f"now. Use tools/calibrate_zeros.py (or --force if you really mean it).")
+        sys.exit(1)
 
     print("--- RobStride RS03 Zero Point Setter ---")
     print("WARNING: this overwrites the internal mechanical zero position.")
@@ -55,7 +66,7 @@ def main():
 
     try:
         with RobotSession(SPEC, use_imu=False, realtime=False,
-                          limp_only=True) as robot:
+                          limp_only=True, raw_frame=True) as robot:
             print("\n[INFO] Transmitting SET_ZERO_POSITION commands...")
             for joint in targets:
                 print(f"  -> {joint.name} ({joint.bus}, id {joint.can_id})...")

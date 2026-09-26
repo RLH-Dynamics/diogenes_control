@@ -1,6 +1,10 @@
 #!/bin/bash
-# Prepare the Harold workspace: bring up both CAN channels, activate the venv.
-# Source it, do not execute it:  source setup.sh
+# Prepare the Harold workspace: bring up both CAN channels, apply the real-time
+# tuning, activate the venv. Everything here is lost at a reboot, so run it
+# after every boot. Source it, do not execute it:  source setup.sh
+#
+# The venv defaults to ./.venv; set HAROLD_VENV to use another, e.g.
+#   HAROLD_VENV=~/harold/2_embedded/.venv source setup.sh
 
 # Must match the channels declared in config.py BUSES.
 CHANNELS="can0 can1"
@@ -37,13 +41,42 @@ for ch in $CHANNELS; do
     echo "[OK]   $ch is up."
 done
 
-if [ ! -d ".venv" ]; then
-    echo "[ERROR] No .venv found. Create it with:"
+# Real-time tuning. Both CAN channels hang off one SPI controller, whose kernel
+# worker (spi0) and interrupt threads run at normal priority by default; an
+# occasional stall there delays whole cycles of CAN traffic, which main-rl.py
+# sees as missing replies. The ondemand governor adds latency as it ramps.
+echo "[INFO] Setting CPU governor to performance..."
+if echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null; then
+    echo "[OK]   governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+else
+    echo "[ERROR] Failed to set the CPU governor."
+    setup_failed=1
+fi
+
+echo "[INFO] Raising SPI worker and CAN interrupt threads to SCHED_FIFO 85..."
+spi_threads="$(pgrep -x spi0) $(pgrep 'irq/[0-9]+-spi0')"
+if [ -z "${spi_threads// /}" ]; then
+    echo "[ERROR] No spi0 threads found. Is SPI enabled (dtparam=spi=on)?"
+    setup_failed=1
+fi
+for pid in $spi_threads; do
+    if sudo chrt -f -p 85 "$pid"; then
+        echo "[OK]   $(cat /proc/$pid/comm) -> $(chrt -p "$pid" | sed -n 's/.*policy: //p' | head -1), priority 85"
+    else
+        echo "[ERROR] Failed to set priority of PID $pid."
+        setup_failed=1
+    fi
+done
+
+venv="${HAROLD_VENV:-.venv}"
+if [ ! -d "$venv" ]; then
+    echo "[ERROR] No virtual environment at $venv. Create one with:"
     echo "        python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    echo "        or point HAROLD_VENV at an existing one."
     setup_failed=1
 else
-    echo "[INFO] Activating Python virtual environment..."
-    source .venv/bin/activate
+    echo "[INFO] Activating Python virtual environment ($venv)..."
+    source "$venv/bin/activate"
 fi
 
 if [ "$setup_failed" -ne 0 ]; then

@@ -21,6 +21,15 @@ policy.py, and still true):
   * obs normalisation is baked into the exported ONNX graph, so raw,
     unnormalised observations are fed in.
   * No obs scale or clip is applied; none is configured on the sim side.
+
+OBSERVATION HISTORY
+-------------------
+With `history_length` H > 0 each term keeps its last H values, reproducing
+mjlab's ObservationManager + CircularBuffer exactly:
+  * layout is TERM-MAJOR: all H steps of the first term, then all H steps of
+    the next, each term's block ordered oldest -> newest;
+  * after a reset, the first observation fills every history slot, rather than
+    padding with zeros.
 """
 
 from dataclasses import dataclass
@@ -87,7 +96,7 @@ TERM_REGISTRY: dict[str, ObsTerm] = {
 class ObservationBuilder:
     """Builds the flat observation vector from a declared list of term names."""
 
-    def __init__(self, spec, term_names: list[str]):
+    def __init__(self, spec, term_names: list[str], history_length: int = 0):
         unknown = [n for n in term_names if n not in TERM_REGISTRY]
         if unknown:
             raise ValueError(
@@ -101,7 +110,16 @@ class ObservationBuilder:
         self.num_joints = spec.num_joints
         self.terms = [TERM_REGISTRY[n] for n in term_names]
         self.widths = [t.width(self.num_joints) for t in self.terms]
-        self.total_width = sum(self.widths)
+        self.history_length = int(history_length)
+        self.steps = max(1, self.history_length)
+        self.frame_width = sum(self.widths)
+        self.total_width = self.frame_width * self.steps
+
+        # Per-term history, rows oldest -> newest. Filled on the first build()
+        # after a reset.
+        self._history = [np.zeros((self.steps, w), dtype=np.float32)
+                         for w in self.widths]
+        self._primed = False
 
         needs_imu = {'base_ang_vel', 'projected_gravity'}
         self.requires_imu = bool(needs_imu.intersection(term_names))
@@ -115,23 +133,39 @@ class ObservationBuilder:
         self._buffer = np.zeros((1, self.total_width), dtype=np.float32)
 
     def describe(self) -> str:
-        lines = [f"Observation layout ({self.total_width} dims):"]
+        history = (f", history {self.history_length} x {self.frame_width}"
+                   if self.history_length else "")
+        lines = [f"Observation layout ({self.total_width} dims{history}):"]
         offset = 0
         for term, width in zip(self.terms, self.widths):
-            lines.append(f"  [{offset:>3}:{offset + width:>3}] {term.name}")
-            offset += width
+            span = width * self.steps
+            steps = f"  ({self.steps} x {width}, oldest first)" if self.history_length else ""
+            lines.append(f"  [{offset:>3}:{offset + span:>3}] {term.name}{steps}")
+            offset += span
         return "\n".join(lines)
 
+    def reset(self):
+        """Start a new episode: the next build() refills every history slot."""
+        self._primed = False
+
     def build(self, ctx: ObsContext) -> np.ndarray:
-        """Fill and return the (1, total_width) observation. Buffer is reused."""
+        """Advance the history by one step and return the (1, total_width)
+        observation. The returned buffer is reused between calls."""
         offset = 0
-        for term, width in zip(self.terms, self.widths):
+        for term, width, hist in zip(self.terms, self.widths, self._history):
             value = np.asarray(term.extract(ctx), dtype=np.float32).ravel()
             if value.size != width:
                 raise ValueError(
                     f"Observation term '{term.name}' produced {value.size} values, "
                     f"expected {width}."
                 )
-            self._buffer[0, offset:offset + width] = value
-            offset += width
+            if self._primed:
+                hist[:-1] = hist[1:]
+                hist[-1] = value
+            else:
+                hist[:] = value
+            span = width * self.steps
+            self._buffer[0, offset:offset + span] = hist.ravel()
+            offset += span
+        self._primed = True
         return self._buffer

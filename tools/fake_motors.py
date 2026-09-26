@@ -51,6 +51,10 @@ class FakeMotor:
         self.legacy = legacy
         self.legacy_timeout_s = legacy_timeout_s
         self.last_rx = None
+        # Test hooks: skip this many status replies, or send this many fault
+        # reports in place of status replies (see FakeRobot.drop_replies).
+        self.drop_replies = 0
+        self.fault_replies = 0
         self.last_t = None
         self.pos = 0.0
         self.vel = 0.0
@@ -114,6 +118,14 @@ class FakeMotorBus(threading.Thread):
                                   is_extended_id=True, dlc=len(data)))
 
     def _send_status(self, motor: FakeMotor):
+        if motor.drop_replies > 0:
+            motor.drop_replies -= 1
+            return
+        if motor.fault_replies > 0:
+            motor.fault_replies -= 1
+            self._send(CommunicationType.FAULT_REPORT, motor.can_id, self.host_id,
+                       b'\x08\x00\x00\x00\x00\x00\x00\x00')
+            return
         lim = self.limits
         payload = struct.pack(
             '>HHHh',
@@ -190,7 +202,10 @@ class FakeMotorBus(threading.Thread):
                                (1 << 8) | motor.can_id, self.host_id,
                                struct.pack('<HHI', index, 0, 0))
                     continue
-                stored = motor.parameters.get(index, b'\x00\x00\x00\x00')
+                if index == 0x7019:   # MECHANICAL_POSITION: the live value
+                    stored = struct.pack('<f', motor.pos)
+                else:
+                    stored = motor.parameters.get(index, b'\x00\x00\x00\x00')
                 payload = struct.pack('<HH', index, 0x0000) + stored
                 self._send(CommunicationType.READ_PARAMETER, motor.can_id,
                            self.host_id, payload)
@@ -199,8 +214,15 @@ class FakeMotorBus(threading.Thread):
 class FakeRobot:
     """Every fake bus described by a RobotSpec."""
 
-    def __init__(self, spec, legacy_motors=(), legacy_timeout_s=None):
-        """`legacy_motors` is a collection of (channel, can_id) pairs."""
+    def __init__(self, spec, legacy_motors=(), legacy_timeout_s=None,
+                 initial_pos=None):
+        """`legacy_motors` is a collection of (channel, can_id) pairs.
+
+        Each joint starts at the hardware-frame image of the sim default pose,
+        where the configured robot expects to find it. `initial_pos` overrides
+        that per joint name, in raw motor radians, e.g. to power a joint up a
+        whole turn out.
+        """
         self.spec = spec
         self.buses = [
             FakeMotorBus(
@@ -214,6 +236,26 @@ class FakeRobot:
             )
             for b in spec.buses
         ]
+        for joint in spec.joints:
+            pos = joint.direction * (joint.default_pos - joint.sim_offset)
+            pos = (initial_pos or {}).get(joint.name, pos)
+            self.bus_for(joint.bus).motors[joint.can_id].pos = pos
+
+    def bus_for(self, channel):
+        return next(b for b in self.buses if b.channel == channel)
+
+    def motor(self, name):
+        joint = self.spec.joint(name)
+        return self.bus_for(joint.bus).motors[joint.can_id]
+
+    def drop_replies(self, name, count=1, as_fault=False):
+        """Make joint `name` skip its next `count` status replies, or answer
+        them with fault reports instead."""
+        motor = self.motor(name)
+        if as_fault:
+            motor.fault_replies = count
+        else:
+            motor.drop_replies = count
 
     def start(self):
         for b in self.buses:

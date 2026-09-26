@@ -16,11 +16,13 @@ responsible for the two things that only make sense at the whole-robot level:
 Above this layer, joints are identified by NAME. CAN ids never escape upward.
 """
 
+import math
 import select
 import time
 
 from robstride.bus import RobstrideBus
-from utils.exceptions import HardwareIOError
+from robstride.protocol import ParameterType
+from utils.exceptions import HardwareIOError, MissedReplies
 
 
 class RobstrideNetwork:
@@ -43,6 +45,11 @@ class RobstrideNetwork:
         self._tx_order = self._build_tx_order()
         self._fd_map: dict[int, RobstrideBus] = {}
         self._use_select = True
+
+        # Whole-turn correction per joint, radians (a multiple of 2*pi). Every
+        # reading has it subtracted and every command has it added, so the
+        # motor and the host agree on where the joint is. See resolve_turns.
+        self.turn_offsets = {j.name: 0.0 for j in spec.joints}
 
         # Rolling diagnostics, read by the recorder and the bring-up scripts.
         self.last_exchange_s = 0.0
@@ -76,6 +83,33 @@ class RobstrideNetwork:
             print("[WARN] CAN backend exposes no fileno(); falling back to polled gather.")
             self._use_select = False
 
+    def resolve_turns(self, names=None):
+        """Correct each motor's power-up position by whole turns.
+
+        A RobStride motor only knows its output angle to within one turn at
+        power-up, so a joint resting slightly below zero can read ~2*pi too
+        high. Every calibrated working position lies within +-pi of the motor's
+        zero (thighs and calves are zeroed at hard stops 103 / 75 deg from sim
+        zero, and their ranges end within ~166 deg of them), so the correction
+        is simply the whole number of turns that brings the reading into
+        (-pi, pi]. Reads position as a parameter, so works on disabled motors.
+        """
+        two_pi = 2.0 * math.pi
+        for joint in self.spec.joints:
+            if names is not None and joint.name not in names:
+                continue
+            bus = self.buses[joint.bus]
+            bus.flush()
+            raw = bus.read_parameter(joint.can_id, ParameterType.MECHANICAL_POSITION)
+            turns = math.floor((raw + math.pi) / two_pi)
+            if raw - turns * two_pi <= -math.pi:   # keep the interval half-open
+                turns -= 1
+            self.turn_offsets[joint.name] = turns * two_pi
+            if turns:
+                print(f"[INFO] {joint.name} powered up {turns:+d} turn(s) out "
+                      f"(raw {raw:+.3f} rad); correcting to "
+                      f"{raw - turns * two_pi:+.3f} rad.")
+
     def verify_watchdogs(self) -> bool:
         # A list, not a generator: all() would stop at the first failing bus and
         # leave the remaining buses unchecked and unreported.
@@ -97,20 +131,21 @@ class RobstrideNetwork:
 
     # -------------------------------------------------------------- control --
 
-    def send(self, targets: dict, kp: float, kd: float):
+    def send(self, targets: dict, kp, kd):
         """Transmit one setpoint per joint. Non-blocking.
 
         `targets` maps joint name -> {'pos', 'vel', 'torque'}; missing keys
-        default to zero. Frames go out in interleaved bus order.
+        default to zero. `kp` / `kd` are one gain for every joint or a dict
+        name -> gain. Frames go out in interleaved bus order.
         """
         for joint in self._tx_order:
             state = targets[joint.name]
             self.buses[joint.bus].send_target_state_vector(
                 motor_id=joint.can_id,
-                pos=state.get('pos', 0.0),
+                pos=state.get('pos', 0.0) + self.turn_offsets[joint.name],
                 vel=state.get('vel', 0.0),
-                kp=kp,
-                kd=kd,
+                kp=kp[joint.name] if isinstance(kp, dict) else kp,
+                kd=kd[joint.name] if isinstance(kd, dict) else kd,
                 torque=state.get('torque', 0.0),
             )
 
@@ -122,6 +157,8 @@ class RobstrideNetwork:
         received: dict[tuple[str, int], dict] = {}
         expected = self.spec.num_joints
         deadline = time.perf_counter() + timeout
+        for bus in self.buses.values():
+            bus.other_frames.clear()
 
         # Frames may already be queued from the transmit we just did.
         for bus in self.buses.values():
@@ -131,11 +168,19 @@ class RobstrideNetwork:
             remaining = deadline - time.perf_counter()
             if remaining <= 0.0:
                 self.timeout_count += 1
-                missing = [j.name for j in self.spec.joints
-                           if j.key not in received]
-                raise HardwareIOError(
+                missing = [j for j in self.spec.joints if j.key not in received]
+                stray = [
+                    f"{j.name}: type {c} extra 0x{x:04x} data {d.hex()}"
+                    for j in missing
+                    for (mid, c, x, d) in self.buses[j.bus].other_frames
+                    if mid == j.can_id
+                ]
+                raise MissedReplies(
                     f"Timeout after {timeout * 1000:.1f} ms waiting for state "
-                    f"replies. Missing joints: {missing}"
+                    f"replies. Missing joints: {[j.name for j in missing]}",
+                    missing=[j.name for j in missing],
+                    state=self._by_name(received),
+                    stray=stray,
                 )
 
             if self._use_select:
@@ -148,10 +193,18 @@ class RobstrideNetwork:
                 if len(received) < expected:
                     time.sleep(0.0002)
 
-        return {self.spec.joint_by_key(*key).name: state
-                for key, state in received.items()}
+        return self._by_name(received)
 
-    def exchange(self, targets: dict, kp: float, kd: float,
+    def _by_name(self, received: dict) -> dict:
+        """(channel, can_id) -> state, to name -> state with turns corrected."""
+        out = {}
+        for key, state in received.items():
+            name = self.spec.joint_by_key(*key).name
+            state['pos'] -= self.turn_offsets[name]
+            out[name] = state
+        return out
+
+    def exchange(self, targets: dict, kp, kd,
                  timeout: float = 0.005) -> dict:
         """Send every setpoint, then collect every reply against one deadline."""
         started = time.perf_counter()

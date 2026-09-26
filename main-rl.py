@@ -22,6 +22,14 @@ Each cycle sends setpoints twice, on purpose:
 That keeps sensor-to-actuator latency at a couple of milliseconds instead of a
 full 20 ms cycle, which matters because the policy was trained with the action
 applied in the same step its observation was taken.
+
+SOFT START
+----------
+The loop opens with a soft start: targets ramp from the resting pose to
+config.START_POSE (the default pose for --dry-run) and hold there, and only
+then is the policy reset and run, so it starts where training episodes start.
+Safety checks, fault checks and logging run identically in both phases, and the
+soft start counts towards --duration.
 """
 
 import argparse
@@ -29,10 +37,15 @@ import dataclasses
 import sys
 import time
 
+import numpy as np
+
 from config import (
-    ACTION_SCALE, CYCLE_PERIOD, MODEL_PATH, OBSERVATION_TERMS, SPEC,
+    ACTION_SCALE, CYCLE_PERIOD, MAX_CONSECUTIVE_MISSED_REPLIES, MODEL_PATH,
+    OBSERVATION_HISTORY, OBSERVATION_TERMS, SIM_OBSERVATION_NAMES,
+    SOFT_START_HOLD_S, SOFT_START_S, SPEC, START_POSE,
 )
 from control.policy import HoldPolicy, Policy
+from control.soft_start import SoftStart
 from robot.session import RobotSession
 from utils.exceptions import (
     ActuatorFault, HardwareError, HardwareIOError, SafetyLimitError,
@@ -100,6 +113,8 @@ def main():
             term_names=OBSERVATION_TERMS,
             action_scale=ACTION_SCALE,
             period=CYCLE_PERIOD,
+            history_length=OBSERVATION_HISTORY,
+            sim_observation_names=SIM_OBSERVATION_NAMES,
         )
 
     safety = SafetyMonitor(spec)
@@ -121,30 +136,57 @@ def main():
             print(f"[INFO] Base tilt at start: "
                   f"{imu_sample.tilt_rad * 57.2958:.1f} deg")
 
-            # Start from where the robot actually is, so the first commanded
-            # step does not yank the joints toward the default pose.
+            # Start from where the robot actually is, then ramp to the start
+            # pose before the policy takes over.
             targets = robot.hold_targets(state)
+            rest_sim, _ = robot.to_sim_frame(*robot.state_arrays(state))
+            goal_sim = (spec.default_pos_vector() if args.dry_run else
+                        np.array([START_POSE[n] for n in spec.names], dtype=np.float32))
+            soft_start = SoftStart(rest_sim, goal_sim, SOFT_START_S, SOFT_START_HOLD_S)
+            policy_running = False
 
-            print("[INFO] Entering control loop (Ctrl+C to stop)...")
-            policy.reset()
+            print(f"[INFO] Soft start: ramping to the "
+                  f"{'default' if args.dry_run else 'start'} pose over "
+                  f"{SOFT_START_S:.1f} s, holding {SOFT_START_HOLD_S:.1f} s "
+                  f"(Ctrl+C to stop)...")
             start_time = time.perf_counter()
             pacer.start()
             overrun_s = 0.0
+            last_state = state
 
             while True:
                 # 1. Apply last cycle's setpoints and collect the state they
-                #    provoke.
-                state = robot.exchange(targets)
+                #    provoke. An isolated missing reply is ridden through on the
+                #    joint's previous reading; MAX_CONSECUTIVE in a row stops.
+                state, miss = robot.exchange_tolerant(
+                    targets, last_state, MAX_CONSECUTIVE_MISSED_REPLIES)
+                if miss is not None:
+                    print(f"\n[WARN] t={time.perf_counter() - start_time:6.2f} s: no reply "
+                          f"from {miss.missing} "
+                          f"({robot.consecutive_misses}/{MAX_CONSECUTIVE_MISSED_REPLIES} "
+                          f"in a row, {robot.total_misses} total)"
+                          + (f"; they sent instead: {miss.stray}" if miss.stray else ""))
                 robot.check_faults()
+                last_state = state
                 safety.verify_measured_state(state)
 
                 # 2. Base state. Never blocks; staleness is a hard fault.
                 imu_sample = robot.read_imu()
                 safety.verify_imu_sample(imu_sample)
 
-                # 3. Policy tick, entirely in the sim frame.
+                # 3. Soft-start ramp, then the policy; both in the sim frame.
                 sim_pos, sim_vel = robot.to_sim_frame(*robot.state_arrays(state))
-                sim_targets = policy.act(sim_pos, sim_vel, imu_sample)
+                elapsed = time.perf_counter() - start_time
+                if not soft_start.done(elapsed):
+                    sim_targets = soft_start.target(elapsed)
+                else:
+                    if not policy_running:
+                        # Fresh clock and observation history, as at an episode start.
+                        policy.reset()
+                        policy_running = True
+                        print(f"[INFO] Soft start complete; "
+                              f"{'holding' if args.dry_run else 'policy running'}.")
+                    sim_targets = policy.act(sim_pos, sim_vel, imu_sample)
 
                 # 4. Back to the hardware frame, and validate before it can move
                 #    anything.
@@ -164,6 +206,7 @@ def main():
                         imu_sample=imu_sample,
                         exchange_s=robot.network.last_exchange_s,
                         overrun_s=overrun_s,
+                        missed=miss.missing if miss is not None else (),
                     )
 
                 if args.duration is not None and (now - start_time) >= args.duration:
@@ -186,6 +229,8 @@ def main():
             simulator.stop()
         restore_gc()
         print(f"[INFO] Loop timing: {pacer.summary()}")
+        if 'robot' in locals() and robot.total_misses:
+            print(f"[INFO] Missed replies ridden through: {robot.total_misses}")
         if recorder is not None:
             recorder.save(prefix=args.log_prefix)
 

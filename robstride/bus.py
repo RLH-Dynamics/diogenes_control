@@ -43,6 +43,11 @@ class RobstrideBus:
         # Populated by drain_into(); the supervisory layer decides what to do.
         self.pending_faults: dict[int, bytes] = {}
 
+        # Frames drain_into() did not use as a status reply, as
+        # (motor_id, comm_type, extra_data, payload). Cleared by the network at
+        # the start of each gather; read when a motor fails to reply.
+        self.other_frames: list[tuple[int, int, int, bytes]] = []
+
     def __repr__(self):
         return f"<RobstrideBus {self.channel} ids={self.can_ids}>"
 
@@ -65,6 +70,20 @@ class RobstrideBus:
     def open(self):
         """Bind to the socketcan interface and arm the motor-side watchdogs."""
         print(f"[INFO] Opening CAN channel {self.channel}...")
+        if self.interface == "socketcan":
+            # A socket binds fine to a DOWN interface and only the first send
+            # fails, so check first. Down is normal after a reboot.
+            try:
+                with open(f"/sys/class/net/{self.channel}/flags") as f:
+                    up = int(f.read(), 16) & 0x1        # IFF_UP
+            except OSError:
+                raise HardwareIOError(
+                    f"{self.channel} does not exist. Check the mcp2515 overlays "
+                    f"in /boot/firmware/config.txt (see README).")
+            if not up:
+                raise HardwareIOError(
+                    f"{self.channel} is down (normal after a reboot). "
+                    f"Run `source setup.sh` first.")
         try:
             self.bus = can.interface.Bus(
                 channel=self.channel, interface=self.interface, bitrate=self.bitrate
@@ -373,11 +392,13 @@ class RobstrideBus:
             if c_type == CommunicationType.FAULT_REPORT:
                 if motor_id in self.can_ids:
                     self.pending_faults[motor_id] = bytes(r_data)
+                self.other_frames.append((motor_id, c_type, extra_data, bytes(r_data)))
                 continue
 
-            if c_type != CommunicationType.OPERATION_STATUS or dest_id != self.host_id:
-                continue
-            if motor_id not in self.can_ids:
+            if (c_type != CommunicationType.OPERATION_STATUS or dest_id != self.host_id
+                    or motor_id not in self.can_ids):
+                if len(self.other_frames) < 64:
+                    self.other_frames.append((motor_id, c_type, extra_data, bytes(r_data)))
                 continue
 
             key = (self.channel, motor_id)

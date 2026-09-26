@@ -4,6 +4,24 @@ class HardwareError(Exception):
 class HardwareIOError(HardwareError):
     """Raised when reading/writing to a physical bus fails (e.g., CAN socket crashes)."""
 
+class MissedReplies(HardwareIOError):
+    """Raised by RobstrideNetwork.gather when some joints did not reply in time.
+
+    Carries what did arrive, so a caller that can tolerate an isolated miss
+    (Robot.exchange_tolerant) can carry on:
+      missing -- joint names with no status reply this cycle
+      state   -- name -> state for the joints that did reply (hardware frame)
+      stray   -- other frames the missing motors sent this cycle, e.g. a fault
+                 report instead of a status reply, as readable strings
+    """
+
+    def __init__(self, message, missing, state, stray):
+        super().__init__(message)
+        self.missing = missing
+        self.state = state
+        self.stray = stray
+
+
 class ParameterRejected(HardwareIOError):
     """Raised when a motor answers a parameter read with its failure flag set.
 
